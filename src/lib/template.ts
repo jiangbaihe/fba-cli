@@ -1,6 +1,7 @@
 // template.ts — 插件模板引擎
 import { readdir, readFile, writeFile, cp, rename, rm } from 'fs/promises'
-import { join, resolve, dirname } from 'path'
+import { existsSync } from 'fs'
+import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
 export interface TemplateVars {
@@ -16,10 +17,33 @@ export interface TemplateVars {
  * 获取 CLI 包内置的 templates 目录路径
  */
 export function getTemplatesDir(): string {
-  // 支持 bun 直接运行和 build 后运行
-  const currentDir = dirname(fileURLToPath(import.meta.url))
-  // src/lib/template.ts -> ../../templates
-  return resolve(currentDir, '..', '..', 'templates')
+  return resolveTemplatesDir(import.meta.url)
+}
+
+/**
+ * 从运行模块位置向上查找包内 templates 目录。
+ * 支持源码运行 (src/lib/template.ts) 和打包后运行 (dist/*.js)。
+ */
+export function resolveTemplatesDir(moduleUrl: string): string {
+  let currentDir = dirname(fileURLToPath(moduleUrl))
+
+  while (true) {
+    const candidate = join(currentDir, 'templates')
+    if (
+      existsSync(join(candidate, 'web'))
+      && existsSync(join(candidate, 'server'))
+    ) {
+      return candidate
+    }
+
+    const parentDir = dirname(currentDir)
+    if (parentDir === currentDir) break
+    currentDir = parentDir
+  }
+
+  throw new Error(
+    `Unable to locate templates directory from ${fileURLToPath(moduleUrl)}`,
+  )
 }
 
 /**

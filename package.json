@@ -1,6 +1,6 @@
 {
   "name": "@fba/cli",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Super CLI tool for creating, managing, and running fastapi-best-architecture projects",
   "type": "module",
   "license": "MIT",
