@@ -49,4 +49,4 @@ npm install -g https://github.com/jiangbaihe/fba-cli/releases/latest/download/fb
 
 Release 资产固定命名为 `fba-cli.tgz`，因此安装命令不需要写具体版本号。发布流程见 `docs/repo-release-design.md`。
 
-该 Release 包由 `repo-v*` tag 触发的 GitHub Actions 构建，发布前会运行测试、类型检查和构建检查。
+该 Release 包由 `repo-v*` tag 触发的 GitHub Actions 构建，发布前会隔离运行测试、类型检查和构建检查。

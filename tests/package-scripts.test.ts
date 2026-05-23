@@ -51,7 +51,7 @@ describe('package scripts', () => {
     expect(repoReleaseWorkflow).toContain('softprops/action-gh-release')
     expect(repoReleaseWorkflow).toContain('oven-sh/setup-bun')
     expect(repoReleaseWorkflow).toContain('pnpm install --frozen-lockfile')
-    expect(repoReleaseWorkflow).toContain('bun test')
+    expect(repoReleaseWorkflow).toContain('bun test --isolate')
     expect(repoReleaseWorkflow).toContain('pnpm run typecheck')
     expect(repoReleaseWorkflow).toContain('pnpm run build')
     expect(repoReleaseWorkflow).not.toContain('pnpm publish')

@@ -161,7 +161,7 @@ git push origin repo-v0.1.10
 
 Actions 会自动执行：
 
-- `bun test`
+- `bun test --isolate`
 - `pnpm run typecheck`
 - `git diff --check`
 - `pnpm run build`

@@ -76,7 +76,7 @@ tag 名必须以 `repo-v` 开头。Release 名称和标题使用该 tag，避免
 3. 安装 Node.js，并启用 pnpm 缓存
 4. 安装 Bun
 5. 使用 `pnpm install --frozen-lockfile` 安装依赖
-6. 运行 `bun test`
+6. 运行 `bun test --isolate`
 7. 运行 `pnpm run typecheck`
 8. 运行 `git diff --check`
 9. 运行 `pnpm run build` 构建 `dist/`
@@ -177,7 +177,7 @@ npm install -g git+https://github.com/jiangbaihe/fba-cli.git#master
 - `.tgz` 不进入 Git 提交
 - `.github/workflows/repo-release.yml` 不包含 `pnpm publish` 或 `NPM_TOKEN`
 - `.github/workflows/release.yml` 保留原项目 npm 发布流程
-- Actions 发布前会运行 `bun test`
+- Actions 发布前会运行 `bun test --isolate`
 - Actions 构建出的包包含 `dist/index.js`
 - GitHub 最新 Release 包含固定资产 `fba-cli.tgz`
 - 固定 latest URL 可以全局安装
