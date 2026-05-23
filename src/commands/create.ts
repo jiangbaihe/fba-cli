@@ -18,6 +18,10 @@ import {
 } from "../lib/env-check.js";
 import { installTool } from "../lib/env-install.js";
 import { gitClone } from "../lib/git.js";
+import {
+  cloneRepositoryForMaintenance,
+  repoCreateText,
+} from "./repo/internal/create-integration.js";
 import { isDockerAvailable, composeUp, composeDown } from "../lib/docker.js";
 import {
   createInfraDir,
@@ -40,11 +44,6 @@ import {
   selectPypiRegistry,
 } from "../lib/registry.js";
 
-const BACKEND_REPO =
-  "https://github.com/fastapi-practices/fastapi-best-architecture.git";
-const FRONTEND_REPO =
-  "https://github.com/fastapi-practices/fastapi-best-architecture-ui.git";
-
 const LOGO = `
   ███████╗██████╗  █████╗       ██████╗██╗     ██╗
   ██╔════╝██╔══██╗██╔══██╗     ██╔════╝██║     ██║
@@ -53,6 +52,11 @@ const LOGO = `
   ██║     ██████╔╝██║  ██║     ╚██████╗███████╗██║
   ╚═╝     ╚═════╝ ╚═╝  ╚═╝      ╚═════╝╚══════╝╚═╝
 `;
+
+const BACKEND_REPO =
+  "https://github.com/fastapi-practices/fastapi-best-architecture.git";
+const FRONTEND_REPO =
+  "https://github.com/fastapi-practices/fastapi-best-architecture-ui.git";
 
 // ─── 回退机制 ───
 let _cleanupDir: string | null = null;
@@ -319,6 +323,12 @@ async function _createFlow() {
   const frontendName = String(projectConfig.frontendName);
   const projectDir = join(projectRoot, projectName);
 
+  const enableRepoMaintenance = await clack.confirm({
+    message: repoCreateText.maintenanceQuestion(),
+    initialValue: false,
+  });
+  if (clack.isCancel(enableRepoMaintenance)) onCancel();
+
   // 创建项目目录 → 从此刻起需要回退
   if (!existsSync(projectDir)) {
     mkdirSync(projectDir, { recursive: true });
@@ -331,10 +341,13 @@ async function _createFlow() {
   const backendDir = join(projectDir, backendName);
   const frontendDir = join(projectDir, frontendName);
 
-  const backendCloned = await gitClone(BACKEND_REPO, backendDir, {
+  const cloneForCreate = enableRepoMaintenance
+    ? cloneRepositoryForMaintenance
+    : gitClone;
+  const backendCloned = await cloneForCreate(BACKEND_REPO, backendDir, {
     label: `${t("labelBackend")} → ${backendName}`,
   });
-  const frontendCloned = await gitClone(FRONTEND_REPO, frontendDir, {
+  const frontendCloned = await cloneForCreate(FRONTEND_REPO, frontendDir, {
     label: `${t("labelFrontend")} → ${frontendName}`,
   });
 
@@ -684,6 +697,28 @@ async function _createFlow() {
     path: projectDir,
     createdAt: new Date().toISOString(),
   });
+
+  // 项目创建已经完成；后续实验性仓库维护失败时只回滚仓库维护自身。
+  _cleanupDir = null;
+  _infraDir = null;
+
+  if (enableRepoMaintenance) {
+    const runRepoInit = await clack.confirm({
+      message: repoCreateText.initNowQuestion(),
+      initialValue: true,
+    });
+    if (!clack.isCancel(runRepoInit) && runRepoInit) {
+      try {
+        const { repoInitAction } = await import("./repo/init.js");
+        const initialized = await repoInitAction({ projectDir });
+        if (!initialized) {
+          clack.log.warn(chalk.yellow(repoCreateText.initFailedHint()));
+        }
+      } catch {
+        clack.log.warn(chalk.yellow(repoCreateText.initFailedHint()));
+      }
+    }
+  }
 
   // ─── 完成 ───
   clack.log.success(chalk.green.bold(t("createSuccess")));

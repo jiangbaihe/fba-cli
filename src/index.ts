@@ -8,6 +8,7 @@ import chalk from 'chalk'
 import { readGlobalConfig, readProjectConfig, resolveProjectDir } from './lib/config.js'
 import { initI18nFromConfig, t } from './lib/i18n.js'
 import { checkForUpdate } from './lib/update-check.js'
+import { registerRepoCommand } from './commands/repo/internal/register.js'
 
 const currentDir = dirname(fileURLToPath(import.meta.url))
 const packageJsonPath = resolve(currentDir, '..', 'package.json')
@@ -167,6 +168,9 @@ pluginCmd
     const { pluginListAction } = await import('./commands/plugin/list.js')
     await pluginListAction({ project: program.opts().project })
   })
+
+// ─── repo ───
+registerRepoCommand(program)
 
 // ─── project management ───
 program
