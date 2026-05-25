@@ -121,22 +121,15 @@ export interface UpstreamSyncPlanItem {
 
 export type SyncWizardAction = OriginSyncAction | UpstreamSyncAction
 
-export interface SyncExecutionResult {
-  item: SyncPlanItem
-  state: SyncExecutionState
-}
-
-export interface SyncExecutionSummary {
-  ok: boolean
-  updated: string[]
-  skipped: string[]
-  failed: string[]
-  pending: string[]
-}
-
 export interface MainRepositoryChangePlan {
   committablePaths: string[]
   unrelatedLines: string[]
+}
+
+export interface BuildMainRepositoryChangePlanInput {
+  porcelainStatus: readonly string[]
+  allowedPaths: readonly string[]
+  hasPointerChange: (path: string) => Promise<boolean | null>
 }
 
 export function getSyncOrder(): SyncRepoRole[] {
@@ -212,15 +205,6 @@ export function buildUpstreamSyncPlan(targets: UpstreamSyncTarget[]): UpstreamSy
     })
 }
 
-export function formatSyncActionSummary(
-  label: string,
-  action: SyncWizardAction,
-  targetRef: string | null,
-): string {
-  const target = targetRef ? ` ${targetRef}` : ''
-  return `${label}: ${action}${target}`
-}
-
 export function buildSyncPlan(
   input: Record<SyncRepoRole, SyncRepositoryProbe>,
   options: BuildSyncPlanOptions = {},
@@ -280,96 +264,11 @@ export function getBlockingSyncPrecheckIssues(issues: SyncPlanIssue[]): SyncPlan
   ].includes(issue.code))
 }
 
-export function getMainRepositoryChangePlan(
-  porcelainStatus: readonly string[],
-  allowedPaths: readonly string[],
-): MainRepositoryChangePlan {
-  const allowed = new Set(allowedPaths)
-  const committablePaths: string[] = []
-  const unrelatedLines: string[] = []
-
-  for (const line of porcelainStatus) {
-    const path = getPorcelainPath(line)
-    if (path && allowed.has(path)) {
-      if (!committablePaths.includes(path)) committablePaths.push(path)
-      continue
-    }
-    unrelatedLines.push(line)
-  }
-
-  return { committablePaths, unrelatedLines }
-}
-
-export function markSyncResult(item: SyncPlanItem, ok: boolean | null): SyncExecutionResult {
-  if (!item.shouldUpdate) {
-    return { item, state: 'skipped' }
-  }
-
-  return {
-    item,
-    state: ok === null ? 'pending' : ok ? 'updated' : 'failed',
-  }
-}
-
-export function summarizeSyncResults(results: SyncExecutionResult[]): SyncExecutionSummary {
-  const updated = results
-    .filter((result) => result.state === 'updated')
-    .map((result) => result.item.label)
-  const skipped = results
-    .filter((result) => result.state === 'skipped')
-    .map((result) => result.item.label)
-  const failed = results
-    .filter((result) => result.state === 'failed')
-    .map((result) => result.item.label)
-  const pending = results
-    .filter((result) => result.state === 'pending')
-    .map((result) => result.item.label)
-
-  return {
-    ok: failed.length === 0 && pending.length === 0,
-    updated,
-    skipped,
-    failed,
-    pending,
-  }
-}
-
-export async function runSyncSequence(
-  items: readonly SyncPlanItem[],
-  fastForward: (item: SyncPlanItem) => Promise<boolean>,
-): Promise<SyncExecutionResult[]> {
-  const results: SyncExecutionResult[] = []
-  let failed = false
-
-  for (const item of items) {
-    if (!item.shouldUpdate) {
-      results.push(markSyncResult(item, null))
-      continue
-    }
-
-    if (failed) {
-      results.push(markSyncResult(item, null))
-      continue
-    }
-
-    const ok = await fastForward(item)
-    results.push(markSyncResult(item, ok))
-    if (!ok) failed = true
-  }
-
-  return results
-}
-
-function assessProbe(
-  probe: SyncRepositoryProbe,
-  errors: SyncPlanIssue[],
-  warnings: SyncPlanIssue[],
-): void {
-  const errorCountBeforeLocalChecks = errors.length
+export function getLocalSyncPrecheckIssues(probe: SyncRepositoryProbe): SyncPlanIssue[] {
+  const errors: SyncPlanIssue[] = []
 
   if (!probe.exists) {
-    errors.push(issue(probe, `${probe.role}.dir`, `${probe.label} directory is missing`))
-    return
+    return [issue(probe, `${probe.role}.dir`, `${probe.label} directory is missing`)]
   }
 
   if (!probe.isGitRoot) {
@@ -394,7 +293,65 @@ function assessProbe(
     errors.push(issue(probe, `${probe.role}.workingTree`, `${probe.label} working tree is not clean`))
   }
 
-  if (errors.length > errorCountBeforeLocalChecks) {
+  return errors
+}
+
+export function getMainRepositoryChangePlan(
+  porcelainStatus: readonly string[],
+  allowedPaths: readonly string[],
+): MainRepositoryChangePlan {
+  const allowed = new Set(allowedPaths)
+  const committablePaths: string[] = []
+  const unrelatedLines: string[] = []
+
+  for (const line of porcelainStatus) {
+    const path = getPorcelainPath(line)
+    if (path && allowed.has(path)) {
+      if (!committablePaths.includes(path)) committablePaths.push(path)
+      continue
+    }
+    unrelatedLines.push(line)
+  }
+
+  return { committablePaths, unrelatedLines }
+}
+
+export async function buildMainRepositoryChangePlan(
+  input: BuildMainRepositoryChangePlanInput,
+): Promise<MainRepositoryChangePlan> {
+  const allowed = new Set(input.allowedPaths)
+  const committablePaths: string[] = []
+  const unrelatedLines: string[] = []
+
+  for (const line of input.porcelainStatus) {
+    const path = getPorcelainPath(line)
+    if (!path || !allowed.has(path)) {
+      unrelatedLines.push(line)
+      continue
+    }
+
+    const hasPointerChange = await input.hasPointerChange(path)
+    if (hasPointerChange === true) {
+      if (!committablePaths.includes(path)) committablePaths.push(path)
+      continue
+    }
+
+    if (hasPointerChange === null) {
+      unrelatedLines.push(line)
+    }
+  }
+
+  return { committablePaths, unrelatedLines }
+}
+
+function assessProbe(
+  probe: SyncRepositoryProbe,
+  errors: SyncPlanIssue[],
+  warnings: SyncPlanIssue[],
+): void {
+  const localErrors = getLocalSyncPrecheckIssues(probe)
+  errors.push(...localErrors)
+  if (localErrors.length > 0) {
     return
   }
 

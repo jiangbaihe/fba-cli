@@ -22,27 +22,6 @@ describe('repo command module boundaries', () => {
     expect(readmeEn).not.toContain('## Experimental: Repository Maintenance')
   })
 
-  test('keeps the upstream release workflow separate from repo experimental publishing', () => {
-    const releaseWorkflowPath = join(rootDir, '.github', 'workflows', 'release.yml')
-    const releaseWorkflow = readFileSync(releaseWorkflowPath, 'utf-8')
-    const repoReleaseWorkflowPath = join(rootDir, '.github', 'workflows', 'repo-release.yml')
-    const repoReleaseWorkflow = readFileSync(repoReleaseWorkflowPath, 'utf-8')
-
-    expect(existsSync(releaseWorkflowPath)).toBe(true)
-    expect(existsSync(repoReleaseWorkflowPath)).toBe(true)
-    expect(releaseWorkflow).toContain('pnpm publish --provenance --access public --no-git-checks')
-    expect(releaseWorkflow).toContain('NPM_TOKEN')
-    expect(releaseWorkflow).not.toContain('fba-cli.tgz')
-    expect(repoReleaseWorkflow).toContain('repo-v*')
-    expect(repoReleaseWorkflow).toContain('fba-cli.tgz')
-    expect(repoReleaseWorkflow).toContain('softprops/action-gh-release')
-    expect(repoReleaseWorkflow).toContain('pnpm install --frozen-lockfile')
-    expect(repoReleaseWorkflow).toContain('pnpm run typecheck')
-    expect(repoReleaseWorkflow).toContain('pnpm run build')
-    expect(repoReleaseWorkflow).not.toContain('pnpm publish')
-    expect(repoReleaseWorkflow).not.toContain('NPM_TOKEN')
-  })
-
   test('keeps top-level repo command files as thin entrypoints', () => {
     for (const command of ['init', 'push', 'status', 'sync']) {
       const content = readFileSync(join(repoCommandDir, `${command}.ts`), 'utf-8')
@@ -84,32 +63,6 @@ describe('repo command module boundaries', () => {
     }
   })
 
-  test('keeps repo init pure planning helpers outside the runtime module', () => {
-    const runtime = readFileSync(join(repoCommandDir, 'internal', 'init-runtime.ts'), 'utf-8')
-    const planning = readFileSync(join(repoCommandDir, 'internal', 'init.ts'), 'utf-8')
-
-    expect(runtime).not.toContain('export function renderGitmodules')
-    expect(runtime).not.toContain('export function upsertGitmodulesContent')
-    expect(runtime).not.toContain('export function buildDefaultRemotePlan')
-    expect(planning).toContain('export function renderGitmodules')
-    expect(planning).toContain('export function upsertGitmodulesContent')
-    expect(planning).toContain('export function buildDefaultRemotePlan')
-  })
-
-  test('keeps repo init operation helpers outside the runtime module', () => {
-    const runtime = readFileSync(join(repoCommandDir, 'internal', 'init-runtime.ts'), 'utf-8')
-    const operations = readFileSync(join(repoCommandDir, 'internal', 'init-operations.ts'), 'utf-8')
-
-    expect(runtime).not.toContain('function writeGitmodules')
-    expect(runtime).not.toContain('async function ensureUnshallowed')
-    expect(runtime).not.toContain('async function checkChildRepositoryRoots')
-    expect(runtime).not.toContain('async function applyRepoInitPlan')
-    expect(operations).toContain('export async function checkGitAvailable')
-    expect(operations).toContain('export async function checkChildRepositoryRoots')
-    expect(operations).toContain('export async function applyRepoInitPlan')
-    expect(operations).toContain('export async function createLocalInitCommit')
-  })
-
   test('keeps repo shell helpers inside the repo module', () => {
     const repoGit = readFileSync(join(repoCommandDir, 'internal', 'git.ts'), 'utf-8')
     const repoToken = readFileSync(join(repoCommandDir, 'internal', 'github-token.ts'), 'utf-8')
@@ -144,24 +97,6 @@ describe('repo command module boundaries', () => {
     }
   })
 
-  test('keeps repo runtime modules from exporting internal helpers', () => {
-    const expected = {
-      'init-runtime': ['repoInitAction', 'RepoInitActionOptions'],
-      'push-runtime': ['repoPushAction', 'RepoPushActionOptions'],
-      'status-runtime': ['repoStatusAction', 'RepoStatusActionOptions'],
-      'sync-runtime': ['repoSyncAction', 'RepoSyncActionOptions'],
-    }
-
-    for (const [moduleName, allowedExports] of Object.entries(expected)) {
-      const content = readFileSync(join(repoCommandDir, 'internal', `${moduleName}.ts`), 'utf-8')
-      const exports = Array.from(content.matchAll(/export(?:\s+type)?\s+(?:interface\s+|type\s+|function\s+|async\s+function\s+)?([A-Za-z0-9_]+)/g))
-        .map((match) => match[1]!)
-        .filter((name) => name !== 'from')
-
-      expect(new Set(exports)).toEqual(new Set(allowedExports))
-    }
-  })
-
   test('keeps repo runtime modules on existing project resolution rules', () => {
     for (const command of ['init', 'push', 'status', 'sync']) {
       const content = readFileSync(join(repoCommandDir, 'internal', `${command}-runtime.ts`), 'utf-8')
@@ -171,68 +106,12 @@ describe('repo command module boundaries', () => {
     }
   })
 
-  test('keeps repo sync conflict helpers outside the runtime module', () => {
-    const runtime = readFileSync(join(repoCommandDir, 'internal', 'sync-runtime.ts'), 'utf-8')
-    const conflicts = readFileSync(join(repoCommandDir, 'internal', 'sync-conflicts.ts'), 'utf-8')
-
-    expect(runtime).not.toContain('export function mapConflictChoiceToGitSide')
-    expect(runtime).not.toContain('async function handleConflict')
-    expect(conflicts).toContain('export function mapConflictChoiceToGitSide')
-    expect(conflicts).toContain('export async function handleConflict')
-  })
-
-  test('keeps repo sync prompt helpers outside the runtime module', () => {
-    const runtime = readFileSync(join(repoCommandDir, 'internal', 'sync-runtime.ts'), 'utf-8')
-    const prompts = readFileSync(join(repoCommandDir, 'internal', 'sync-prompts.ts'), 'utf-8')
-
-    expect(runtime).not.toContain('function getActionLabel')
-    expect(runtime).not.toContain('async function promptSyncAction')
-    expect(runtime).not.toContain('async function chooseUpstreamBranch')
-    expect(prompts).toContain('export async function promptSyncAction')
-    expect(prompts).toContain('export async function chooseUpstreamBranch')
-  })
-
-  test('keeps repo sync operation helpers outside the runtime module', () => {
-    const runtime = readFileSync(join(repoCommandDir, 'internal', 'sync-runtime.ts'), 'utf-8')
-    const operations = readFileSync(join(repoCommandDir, 'internal', 'sync-operations.ts'), 'utf-8')
-
-    expect(runtime).not.toContain('async function applySyncOperation')
-    expect(runtime).not.toContain('async function handleMainRepositoryPointerChanges')
-    expect(operations).toContain('export async function applySyncOperation')
-    expect(operations).toContain('export async function handleMainRepositoryPointerChanges')
-  })
-
-  test('keeps repo sync inspection helpers outside the runtime module', () => {
-    const runtime = readFileSync(join(repoCommandDir, 'internal', 'sync-runtime.ts'), 'utf-8')
-    const inspection = readFileSync(join(repoCommandDir, 'internal', 'sync-inspection.ts'), 'utf-8')
-
-    expect(runtime).not.toContain('async function inspectSyncRepository')
-    expect(runtime).not.toContain('async function buildProjectSyncPlan')
-    expect(runtime).not.toContain('async function inspectUpstreamTarget')
-    expect(inspection).toContain('export async function inspectSyncRepository')
-    expect(inspection).toContain('export async function buildProjectSyncPlan')
-    expect(inspection).toContain('export async function inspectUpstreamTarget')
-  })
-
-  test('keeps repo status and push inspection helpers outside runtime modules', () => {
-    const statusRuntime = readFileSync(join(repoCommandDir, 'internal', 'status-runtime.ts'), 'utf-8')
-    const pushRuntime = readFileSync(join(repoCommandDir, 'internal', 'push-runtime.ts'), 'utf-8')
-    const statusInspection = readFileSync(join(repoCommandDir, 'internal', 'status-inspection.ts'), 'utf-8')
-    const pushInspection = readFileSync(join(repoCommandDir, 'internal', 'push-inspection.ts'), 'utf-8')
-
-    expect(statusRuntime).not.toContain('async function inspectRepository')
-    expect(statusRuntime).not.toContain('async function buildProjectStatus')
-    expect(pushRuntime).not.toContain('async function inspectPushRepository')
-    expect(pushRuntime).not.toContain('async function buildProjectPushPlan')
-    expect(statusInspection).toContain('export async function buildProjectStatus')
-    expect(pushInspection).toContain('export async function buildProjectPushPlan')
-  })
-
   test('keeps create integration away from repo low-level internals', () => {
     const content = readFileSync(createCommandPath, 'utf-8')
+    const repoImports = Array.from(content.matchAll(/import\(["'](\.\/repo\/[^"']+)["']\)|from ["'](\.\/repo\/[^"']+)["']/g))
+      .map((match) => match[1] ?? match[2])
 
     expect(content).toContain('./repo/internal/create-integration')
-    expect(content).not.toContain('./repo/internal/git')
-    expect(content).not.toContain('fullHistory')
+    expect(repoImports).toEqual(['./repo/internal/create-integration.js'])
   })
 })

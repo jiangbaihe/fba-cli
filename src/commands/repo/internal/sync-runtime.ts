@@ -4,10 +4,14 @@ import { existsSync } from 'fs'
 import { join } from 'path'
 import { resolveProjectDir } from '../../../lib/config.js'
 import { rt } from './text.js'
+import { formatErrorMessage } from './display.js'
 import {
   getAheadBehind,
+  getPorcelainStatus,
   getRemoteBranchRef,
+  hasSubmodulePointerChange,
 } from './git.js'
+import { resolveGitHubToken } from './github-token.js'
 import {
   buildProjectSyncPlan,
   inspectMainSyncRepository,
@@ -29,7 +33,9 @@ import { readStrictProjectConfig } from './project.js'
 import {
   buildOriginSyncPlan,
   buildUpstreamSyncPlan,
+  buildMainRepositoryChangePlan,
   getBlockingSyncPrecheckIssues,
+  getLocalSyncPrecheckIssues,
   getMainRepositoryChangePlan,
   type OriginSyncPlanItem,
   type OriginSyncAction,
@@ -53,6 +59,7 @@ interface OriginPhaseResult {
 
 interface RunOriginPhaseOptions {
   skipMainOrigin?: boolean
+  authToken?: string
 }
 
 function renderIssue(issue: SyncPlanIssue): string {
@@ -66,7 +73,7 @@ function isAllowedMainPointerIssue(issue: SyncPlanIssue, plan: ProjectSyncPlan):
 
   const changePlan = getMainRepositoryChangePlan(
     status,
-    ['.gitmodules', plan.config.backend_name, plan.config.frontend_name],
+    [plan.config.backend_name, plan.config.frontend_name],
   )
   return changePlan.unrelatedLines.length === 0
 }
@@ -90,6 +97,20 @@ function renderPrecheckIssues(plan: ProjectSyncPlan, options: { allowMainPointer
   return false
 }
 
+function renderPrecheckIssueList(issues: SyncPlanIssue[]): void {
+  clack.log.error(chalk.red(rt('repoSyncBlocked')))
+  for (const issue of issues) {
+    clack.log.error(chalk.red(renderIssue(issue)))
+  }
+}
+
+function hasOnlyMainPointerPrecheckIssues(plan: ProjectSyncPlan): boolean {
+  if (plan.precheck.ok) return false
+
+  const blocking = getBlockingSyncPrecheckIssues(plan.precheck.errors)
+  return blocking.length > 0 && blocking.every((issue) => isAllowedMainPointerIssue(issue, plan))
+}
+
 function getMainOriginPlanItem(probe: SyncRepositoryProbe): OriginSyncPlanItem | null {
   return buildOriginSyncPlan([{
     probe,
@@ -105,11 +126,12 @@ interface MainPrecheckRefreshResult {
 
 async function refreshMainBeforeProjectPrecheck(
   projectDir: string,
+  authToken?: string,
 ): Promise<MainPrecheckRefreshResult> {
-  const mainProbe = await inspectMainSyncRepository(projectDir)
+  const mainProbe = await inspectMainSyncRepository(projectDir, { authToken })
   const item = getMainOriginPlanItem(mainProbe)
   if (!item) return { result: 'failed', probe: mainProbe }
-  if (item.state !== 'fast-forward' && item.state !== 'diverged') {
+  if (item.state !== 'fast-forward') {
     return { result: null, probe: mainProbe }
   }
 
@@ -130,10 +152,63 @@ async function refreshMainBeforeProjectPrecheck(
   }
 }
 
+async function handleInitialMainPointerChanges(
+  projectDir: string,
+  plan: ProjectSyncPlan,
+  authToken?: string,
+): Promise<{ result: SyncCommandResult | null; plan: ProjectSyncPlan }> {
+  if (!hasOnlyMainPointerPrecheckIssues(plan)) {
+    return { result: null, plan }
+  }
+
+  const pointerResult = await handleMainRepositoryPointerChanges({
+    backendName: plan.config.backend_name,
+    frontendName: plan.config.frontend_name,
+    projectDir,
+    isCancelled,
+  })
+  if (pointerResult !== 'updated') {
+    return { result: pointerResult, plan }
+  }
+
+  try {
+    return {
+      result: pointerResult,
+      plan: await buildProjectSyncPlan(projectDir, { authToken }),
+    }
+  } catch (error) {
+    console.log(chalk.red(formatErrorMessage(error)))
+    return { result: 'failed', plan }
+  }
+}
+
+async function handleStartupMainPointerChanges(input: {
+  projectDir: string
+  config: ReturnType<typeof readStrictProjectConfig>
+  mainProbe: SyncRepositoryProbe
+}): Promise<SyncCommandResult | null> {
+  if (!input.mainProbe.isGitRoot || !input.mainProbe.currentBranch) return null
+
+  const status = input.mainProbe.porcelainStatus
+  if (!status || status.length === 0) return null
+
+  const changePlan = await buildMainRepositoryChangePlan({
+    porcelainStatus: status,
+    allowedPaths: [input.config.backend_name, input.config.frontend_name],
+    hasPointerChange: (path) => hasSubmodulePointerChange(input.projectDir, path),
+  })
+  if (changePlan.committablePaths.length === 0 || changePlan.unrelatedLines.length > 0) return null
+
+  return handleMainRepositoryPointerChanges({
+    backendName: input.config.backend_name,
+    frontendName: input.config.frontend_name,
+    projectDir: input.projectDir,
+    isCancelled,
+  })
+}
+
 function isMainPrecheckRefreshAction(action: SyncWizardAction): action is OriginSyncAction {
   return action === 'fast-forward-origin'
-    || action === 'merge-origin'
-    || action === 'rebase-origin'
 }
 
 async function runOriginPhase(
@@ -188,9 +263,9 @@ async function runOriginPhase(
     }
     if (result === 'updated' && item.role === 'main') {
       try {
-        currentPlan = await buildProjectSyncPlan(projectDir)
+        currentPlan = await buildProjectSyncPlan(projectDir, { authToken: options.authToken })
       } catch (error) {
-        console.log(chalk.red(error instanceof Error ? error.message : String(error)))
+        console.log(chalk.red(formatErrorMessage(error)))
         results.push('failed')
         return { results, childUpdated, plan: currentPlan }
       }
@@ -230,20 +305,25 @@ async function runUpstreamPhase(
   probes: Record<SyncRepoRole, SyncRepositoryProbe>,
   config: ProjectSyncPlan['config'],
   projectDir: string,
+  authToken?: string,
 ): Promise<SyncCommandResult[]> {
   clack.log.step(rt('repoSyncUpstreamPhase'))
-  const targets = await Promise.all([probes.backend, probes.frontend].map(inspectUpstreamTarget))
+  const targets = await Promise.all([probes.backend, probes.frontend].map((probe) => (
+    inspectUpstreamTarget(probe, { authToken })
+  )))
   const fetchFailures = targets.filter((target) => !target.fetchOk)
+  const results: SyncCommandResult[] = []
   for (const target of fetchFailures) {
     if (target.probe.upstreamUrl !== target.probe.expectedUpstreamUrl) {
       clack.log.warn(chalk.yellow(`${target.probe.label}: ${rt('repoSyncUpstreamMismatch')}`))
+      results.push('skipped')
     } else {
       clack.log.warn(chalk.yellow(`${target.probe.label}: ${rt('repoSyncUpstreamFetchFailed')}`))
+      results.push('failed')
     }
   }
 
   const plan = buildUpstreamSyncPlan(targets.filter((target) => target.fetchOk))
-  const results: SyncCommandResult[] = []
 
   for (let item of plan) {
     if (item.state === 'up-to-date') {
@@ -264,12 +344,16 @@ async function runUpstreamPhase(
     }
 
     if (action === 'choose-upstream-branch') {
-      const branch = await chooseUpstreamBranch(item)
-      if (!branch) {
+      const branchChoice = await chooseUpstreamBranch(item)
+      if (branchChoice.status === 'cancelled') {
+        results.push('cancelled')
+        return results
+      }
+      if (branchChoice.status === 'skipped') {
         results.push('skipped')
         continue
       }
-      const refreshed = await refreshUpstreamItem(item, probes[item.role], branch)
+      const refreshed = await refreshUpstreamItem(item, probes[item.role], branchChoice.branch)
       if (!refreshed) {
         results.push('failed')
         return results
@@ -287,7 +371,7 @@ async function runUpstreamPhase(
       }
       const nextAction = await promptChosenUpstreamAction(item)
       if (!nextAction || nextAction === 'cancel') {
-        results.push(nextAction === 'cancel' ? 'cancelled' : 'skipped')
+        results.push('cancelled')
         return results
       }
       const result = await applySyncOperation({
@@ -326,6 +410,31 @@ async function runUpstreamPhase(
   return results
 }
 
+async function getUnresolvedMainPointerResult(
+  projectDir: string,
+  config: ProjectSyncPlan['config'],
+): Promise<SyncCommandResult | null> {
+  const porcelainStatus = await getPorcelainStatus(projectDir)
+  if (porcelainStatus === null) return 'failed'
+  if (porcelainStatus.length === 0) return null
+
+  const changePlan = await buildMainRepositoryChangePlan({
+    porcelainStatus,
+    allowedPaths: [config.backend_name, config.frontend_name],
+    hasPointerChange: (path) => hasSubmodulePointerChange(projectDir, path),
+  })
+  if (changePlan.committablePaths.length > 0 && changePlan.unrelatedLines.length === 0) {
+    clack.note(changePlan.committablePaths.join('\n'), rt('repoSyncMainPointerChanges'))
+    return 'stopped'
+  }
+  if (changePlan.unrelatedLines.length > 0) {
+    clack.note(changePlan.unrelatedLines.join('\n'), rt('repoSyncMainUnrelatedChanges'))
+    return 'stopped'
+  }
+
+  return null
+}
+
 function printSyncSummary(results: SyncCommandResult[]): void {
   const updated = results.filter((result) => result === 'updated').length
   const skipped = results.filter((result) => result === 'skipped').length
@@ -354,7 +463,7 @@ export async function repoSyncAction(options: RepoSyncActionOptions = {}) {
   try {
     config = readStrictProjectConfig(projectDir)
   } catch (error) {
-    console.log(chalk.red(error instanceof Error ? error.message : String(error)))
+    console.log(chalk.red(formatErrorMessage(error)))
     return
   }
 
@@ -367,9 +476,11 @@ export async function repoSyncAction(options: RepoSyncActionOptions = {}) {
     return
   }
 
+  const authToken = (await resolveGitHubToken())?.token
+
   let plan: ProjectSyncPlan
   const precheckRefreshResults: SyncCommandResult[] = []
-  const mainPrecheckRefresh = await refreshMainBeforeProjectPrecheck(projectDir)
+  const mainPrecheckRefresh = await refreshMainBeforeProjectPrecheck(projectDir, authToken)
   const precheckRefreshResult = mainPrecheckRefresh.result
   if (precheckRefreshResult) {
     if (precheckRefreshResult === 'updated') {
@@ -381,25 +492,63 @@ export async function repoSyncAction(options: RepoSyncActionOptions = {}) {
     }
   }
 
+  const startupPointerResult = precheckRefreshResult === 'updated'
+    ? null
+    : await handleStartupMainPointerChanges({
+      projectDir,
+      config,
+      mainProbe: mainPrecheckRefresh.probe,
+    })
+  if (startupPointerResult) {
+    if (startupPointerResult === 'updated') {
+      precheckRefreshResults.push(startupPointerResult)
+    } else {
+      printSyncSummary([startupPointerResult])
+      clack.outro(chalk.yellow(rt('repoSyncFixHint')))
+      return
+    }
+  }
+
+  if (startupPointerResult !== 'updated') {
+    const mainLocalIssues = getLocalSyncPrecheckIssues(mainPrecheckRefresh.probe)
+    if (mainLocalIssues.length > 0) {
+      renderPrecheckIssueList(mainLocalIssues)
+      clack.outro(chalk.yellow(rt('repoSyncFixHint')))
+      return
+    }
+  }
+
   try {
     plan = await buildProjectSyncPlan(
       projectDir,
-      precheckRefreshResult === 'updated'
-        ? {}
-        : { mainProbe: mainPrecheckRefresh.probe },
+      precheckRefreshResult === 'updated' || startupPointerResult === 'updated'
+        ? { authToken }
+        : { mainProbe: mainPrecheckRefresh.probe, authToken },
     )
   } catch (error) {
-    console.log(chalk.red(error instanceof Error ? error.message : String(error)))
+    console.log(chalk.red(formatErrorMessage(error)))
     return
   }
 
   if (!renderPrecheckIssues(plan, { allowMainPointerChanges: precheckRefreshResult === 'updated' })) {
-    clack.outro(chalk.yellow(rt('repoSyncFixHint')))
-    return
+    const pointerPrecheck = await handleInitialMainPointerChanges(projectDir, plan, authToken)
+    if (pointerPrecheck.result === 'updated') {
+      precheckRefreshResults.push(pointerPrecheck.result)
+      plan = pointerPrecheck.plan
+      if (!renderPrecheckIssues(plan)) {
+        clack.outro(chalk.yellow(rt('repoSyncFixHint')))
+        return
+      }
+    } else {
+      if (pointerPrecheck.result) printSyncSummary([pointerPrecheck.result])
+      clack.outro(chalk.yellow(rt('repoSyncFixHint')))
+      return
+    }
   }
 
   const originPhase = await runOriginPhase(projectDir, plan, {
     skipMainOrigin: precheckRefreshResult === 'skipped',
+    authToken,
   })
   plan = originPhase.plan
   const originResults = [...precheckRefreshResults, ...originPhase.results]
@@ -424,16 +573,28 @@ export async function repoSyncAction(options: RepoSyncActionOptions = {}) {
     }
   }
 
+  const unresolvedMainPointerResult = originPhase.childUpdated
+    ? null
+    : await getUnresolvedMainPointerResult(projectDir, plan.config)
+  if (unresolvedMainPointerResult) {
+    originResults.push(unresolvedMainPointerResult)
+    printSyncSummary(originResults)
+    clack.outro(chalk.yellow(rt('repoSyncRetryHint')))
+    return
+  }
+
   const followUpstream = await clack.confirm({
     message: rt('repoSyncFollowUpstreamQuestion'),
     initialValue: true,
   })
   if (isCancelled(followUpstream)) {
+    printSyncSummary(originResults)
     clack.cancel(chalk.yellow(rt('repoSyncCancelled')))
+    clack.outro(chalk.yellow(rt('repoSyncRetryHint')))
     return
   }
 
-  const upstreamResults = followUpstream ? await runUpstreamPhase(plan.probes, plan.config, projectDir) : []
+  const upstreamResults = followUpstream ? await runUpstreamPhase(plan.probes, plan.config, projectDir, authToken) : []
   const allResults = [...originResults, ...upstreamResults]
   printSyncSummary(allResults)
 

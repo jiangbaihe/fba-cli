@@ -14,6 +14,8 @@ describe('repo init local commit helper', () => {
   })
 
   test('stages repository metadata before creating the local commit', async () => {
+    runMock.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
     await expect(createLocalInitCommit('project', {
       name: 'jubao-mes',
       backend_name: 'server',
@@ -23,11 +25,17 @@ describe('repo init local commit helper', () => {
     expect(runMock).toHaveBeenNthCalledWith(
       1,
       'git',
-      ['add', '.gitmodules', 'server', 'web'],
+      ['diff', '--cached', '--name-only', '-z', '--', '.gitmodules', 'server', 'web'],
       expect.objectContaining({ cwd: 'project' }),
     )
     expect(runMock).toHaveBeenNthCalledWith(
       2,
+      'git',
+      ['add', '.gitmodules', 'server', 'web'],
+      expect.objectContaining({ cwd: 'project' }),
+    )
+    expect(runMock).toHaveBeenNthCalledWith(
+      3,
       'git',
       [
         'commit',
@@ -43,7 +51,21 @@ describe('repo init local commit helper', () => {
   })
 
   test('returns false when staging fails', async () => {
-    runMock.mockResolvedValueOnce({ stdout: '', stderr: 'add failed', exitCode: 1 })
+    runMock
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: 'add failed', exitCode: 1 })
+
+    await expect(createLocalInitCommit('project', {
+      name: 'jubao-mes',
+      backend_name: 'server',
+      frontend_name: 'web',
+    })).resolves.toBe(false)
+
+    expect(runMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('skips the local commit when target paths already have staged changes', async () => {
+    runMock.mockResolvedValueOnce({ stdout: 'server\0', stderr: '', exitCode: 0 })
 
     await expect(createLocalInitCommit('project', {
       name: 'jubao-mes',
@@ -52,10 +74,16 @@ describe('repo init local commit helper', () => {
     })).resolves.toBe(false)
 
     expect(runMock).toHaveBeenCalledTimes(1)
+    expect(runMock).toHaveBeenCalledWith(
+      'git',
+      ['diff', '--cached', '--name-only', '-z', '--', '.gitmodules', 'server', 'web'],
+      expect.objectContaining({ cwd: 'project' }),
+    )
   })
 
   test('returns false when commit fails', async () => {
     runMock
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
       .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
       .mockResolvedValueOnce({ stdout: '', stderr: 'missing identity', exitCode: 1 })
 
@@ -65,6 +93,12 @@ describe('repo init local commit helper', () => {
       frontend_name: 'web',
     })).resolves.toBe(false)
 
-    expect(runMock).toHaveBeenCalledTimes(2)
+    expect(runMock).toHaveBeenCalledTimes(4)
+    expect(runMock).toHaveBeenNthCalledWith(
+      4,
+      'git',
+      ['reset', '--', '.gitmodules', 'server', 'web'],
+      expect.objectContaining({ cwd: 'project' }),
+    )
   })
 })

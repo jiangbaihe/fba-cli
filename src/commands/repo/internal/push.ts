@@ -1,4 +1,5 @@
 import type { StatusCheck } from './status.js'
+import { getMainRepositoryChangePlan } from './sync.js'
 
 export type PushRepoRole = 'main' | 'backend' | 'frontend'
 
@@ -37,6 +38,7 @@ export type PushPlanResult =
 
 export interface BuildPushPlanOptions {
   gitmodulesErrors?: PushPlanIssue[]
+  mainAllowedDirtyPaths?: string[]
 }
 
 export type PushExecutionPhase = 'dry-run' | 'push'
@@ -59,15 +61,48 @@ export function getPushOrder(): PushRepoRole[] {
   return ['backend', 'frontend', 'main']
 }
 
+export function getSelectablePushItems(
+  items: readonly PushPlanItem[],
+  selectedRoles: readonly PushRepoRole[],
+): PushPlanItem[] {
+  const selected = new Set(selectedRoles)
+  const itemByRole = new Map(items.map((item) => [item.role, item]))
+
+  return getPushOrder()
+    .filter((role) => selected.has(role))
+    .map((role) => itemByRole.get(role))
+    .filter((item): item is PushPlanItem => Boolean(item))
+}
+
+export function getSelectablePushItemsFromProbes(
+  input: Record<PushRepoRole, PushRepositoryProbe>,
+): PushPlanItem[] {
+  return getPushOrder()
+    .map((role) => toPushPlanItem(input[role]))
+    .filter((item): item is PushPlanItem => Boolean(item))
+}
+
 export function buildPushPlan(
   input: Record<PushRepoRole, PushRepositoryProbe>,
   options: BuildPushPlanOptions = {},
 ): PushPlanResult {
-  const errors: PushPlanIssue[] = [...(options.gitmodulesErrors ?? [])]
+  return buildPushPlanForRoles(input, getPushOrder(), options)
+}
+
+export function buildPushPlanForRoles(
+  input: Record<PushRepoRole, PushRepositoryProbe>,
+  roles: readonly PushRepoRole[],
+  options: BuildPushPlanOptions = {},
+): PushPlanResult {
+  const selected = new Set(roles)
+  const errors: PushPlanIssue[] = [
+    ...(options.gitmodulesErrors ?? []).filter((error) => selected.has(error.role)),
+  ]
   const warnings: PushPlanIssue[] = []
 
   for (const role of getPushOrder()) {
-    assessProbe(input[role], errors, warnings)
+    if (!selected.has(role)) continue
+    assessProbe(input[role], errors, warnings, options)
   }
 
   if (errors.length > 0) {
@@ -77,16 +112,7 @@ export function buildPushPlan(
   return {
     ok: true,
     warnings,
-    items: getPushOrder().map((role) => {
-      const probe = input[role]
-      return {
-        role: probe.role,
-        label: probe.label,
-        dir: probe.dir,
-        branch: probe.currentBranch!,
-        originUrl: probe.originUrl!,
-      }
-    }),
+    items: getSelectablePushItemsFromProbes(input).filter((item) => selected.has(item.role)),
   }
 }
 
@@ -177,6 +203,7 @@ function assessProbe(
   probe: PushRepositoryProbe,
   errors: PushPlanIssue[],
   warnings: PushPlanIssue[],
+  options: BuildPushPlanOptions,
 ): void {
   if (!probe.exists) {
     errors.push(issue(probe, `${probe.role}.dir`, `${probe.label} directory is missing`))
@@ -197,11 +224,11 @@ function assessProbe(
 
   if (probe.porcelainStatus === null) {
     errors.push(issue(probe, `${probe.role}.workingTree`, `${probe.label} working tree status could not be read`))
-  } else if (probe.porcelainStatus.length > 0) {
+  } else if (probe.porcelainStatus.length > 0 && !isAllowedDirtyMainProbe(probe, options)) {
     errors.push(issue(probe, `${probe.role}.workingTree`, `${probe.label} working tree is not clean`))
   }
 
-  if (probe.role !== 'main' && probe.isShallow) {
+  if (probe.isShallow) {
     errors.push(issue(probe, `${probe.role}.shallow`, `${probe.label} is a shallow clone`))
   }
 
@@ -212,6 +239,30 @@ function assessProbe(
   ) {
     warnings.push(issue(probe, `${probe.role}.upstream`, `${probe.label} upstream does not match official repository`))
   }
+}
+
+function toPushPlanItem(probe: PushRepositoryProbe): PushPlanItem | null {
+  if (!probe.exists || !probe.isGitRoot || !probe.currentBranch || !probe.originUrl) return null
+
+  return {
+    role: probe.role,
+    label: probe.label,
+    dir: probe.dir,
+    branch: probe.currentBranch,
+    originUrl: probe.originUrl,
+  }
+}
+
+function isAllowedDirtyMainProbe(
+  probe: PushRepositoryProbe,
+  options: BuildPushPlanOptions,
+): boolean {
+  if (probe.role !== 'main' || !options.mainAllowedDirtyPaths || !probe.porcelainStatus) {
+    return false
+  }
+
+  const changePlan = getMainRepositoryChangePlan(probe.porcelainStatus, options.mainAllowedDirtyPaths)
+  return changePlan.committablePaths.length > 0 && changePlan.unrelatedLines.length === 0
 }
 
 function issue(probe: PushRepositoryProbe, code: string, message: string): PushPlanIssue {

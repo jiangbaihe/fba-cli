@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -19,9 +19,25 @@ const ensureRemoteMock = mock(async (dir: string, name: string, url: string) => 
 const removeRemoteMock = mock(async (dir: string, name: string) => {
   remoteUrls.delete(remoteKey(dir, name))
 })
+const deinitSubmodulesMock = mock(async () => true)
+const deleteLocalBranchMock = mock(async () => true)
+const getCurrentBranchMock = mock(async () => 'main')
+const getHeadCommitMock = mock(async () => 'HEAD')
+const isGitRepoRootMock = mock(async () => true)
+const listLocalBranchesMock = mock(async () => ['main'])
+const checkoutExistingBranchMock = mock(async () => true)
+const checkoutDetachedMock = mock(async () => true)
 
 mock.module('../src/commands/repo/internal/git.ts', () => ({
+  checkoutDetached: checkoutDetachedMock,
+  checkoutExistingBranch: checkoutExistingBranchMock,
+  deleteLocalBranch: deleteLocalBranchMock,
+  deinitSubmodules: deinitSubmodulesMock,
   getRemoteUrl: getRemoteUrlMock,
+  getCurrentBranch: getCurrentBranchMock,
+  getHeadCommit: getHeadCommitMock,
+  isGitRepoRoot: isGitRepoRootMock,
+  listLocalBranches: listLocalBranchesMock,
   ensureRemote: ensureRemoteMock,
   removeRemote: removeRemoteMock,
 }))
@@ -48,6 +64,20 @@ describe('repo init transaction', () => {
     getRemoteUrlMock.mockClear()
     ensureRemoteMock.mockClear()
     removeRemoteMock.mockClear()
+    deleteLocalBranchMock.mockClear()
+    deinitSubmodulesMock.mockClear()
+    getCurrentBranchMock.mockReset()
+    getCurrentBranchMock.mockImplementation(async () => 'main')
+    getHeadCommitMock.mockReset()
+    getHeadCommitMock.mockImplementation(async () => 'HEAD')
+    listLocalBranchesMock.mockReset()
+    listLocalBranchesMock.mockImplementation(async () => ['main'])
+    isGitRepoRootMock.mockReset()
+    isGitRepoRootMock.mockImplementation(async () => true)
+    checkoutExistingBranchMock.mockReset()
+    checkoutExistingBranchMock.mockImplementation(async () => true)
+    checkoutDetachedMock.mockReset()
+    checkoutDetachedMock.mockImplementation(async () => true)
   })
 
   afterEach(() => {
@@ -113,6 +143,62 @@ describe('repo init transaction', () => {
     expect(existsSync(join(existingGitDir, '.git'))).toBe(true)
   })
 
+  test('removes child repository directories created during init rollback', async () => {
+    const projectDir = makeTempDir()
+    const backendDir = join(projectDir, 'backend')
+    const frontendDir = join(projectDir, 'frontend')
+    dirs.push(projectDir)
+
+    const snapshot = await createRepoInitSnapshot({ projectDir, backendDir, frontendDir })
+    mkdirSync(backendDir, { recursive: true })
+    writeFileSync(join(backendDir, '.git'), 'gitdir: ../.git/modules/backend', 'utf-8')
+    mkdirSync(frontendDir, { recursive: true })
+    writeFileSync(join(frontendDir, '.git'), 'gitdir: ../.git/modules/frontend', 'utf-8')
+
+    await restoreRepoInitSnapshot(snapshot)
+
+    expect(existsSync(backendDir)).toBe(false)
+    expect(existsSync(frontendDir)).toBe(false)
+  })
+
+  test('cleans submodule metadata created during init rollback', async () => {
+    const projectDir = makeTempDir()
+    const backendDir = join(projectDir, 'backend')
+    const frontendDir = join(projectDir, 'frontend')
+    dirs.push(projectDir)
+
+    const snapshot = await createRepoInitSnapshot({ projectDir, backendDir, frontendDir })
+    mkdirSync(join(projectDir, '.git', 'modules', 'backend'), { recursive: true })
+    writeFileSync(join(projectDir, '.git', 'modules', 'backend', 'config'), 'created', 'utf-8')
+    mkdirSync(join(projectDir, '.git', 'modules', 'frontend'), { recursive: true })
+    writeFileSync(join(projectDir, '.git', 'modules', 'frontend', 'config'), 'created', 'utf-8')
+
+    await restoreRepoInitSnapshot(snapshot)
+
+    expect(deinitSubmodulesMock).toHaveBeenCalledWith(projectDir, ['backend', 'frontend'])
+    expect(existsSync(join(projectDir, '.git', 'modules', 'backend'))).toBe(false)
+    expect(existsSync(join(projectDir, '.git', 'modules', 'frontend'))).toBe(false)
+  })
+
+  test('keeps existing submodule metadata during init rollback', async () => {
+    const projectDir = makeTempDir()
+    const backendDir = join(projectDir, 'backend')
+    const frontendDir = join(projectDir, 'frontend')
+    dirs.push(projectDir)
+    mkdirSync(join(projectDir, '.git', 'modules', 'backend'), { recursive: true })
+    writeFileSync(join(projectDir, '.git', 'modules', 'backend', 'config'), 'existing', 'utf-8')
+
+    const snapshot = await createRepoInitSnapshot({ projectDir, backendDir, frontendDir })
+    mkdirSync(join(projectDir, '.git', 'modules', 'frontend'), { recursive: true })
+    writeFileSync(join(projectDir, '.git', 'modules', 'frontend', 'config'), 'created', 'utf-8')
+
+    await restoreRepoInitSnapshot(snapshot)
+
+    expect(deinitSubmodulesMock).toHaveBeenCalledWith(projectDir, ['frontend'])
+    expect(readFileSync(join(projectDir, '.git', 'modules', 'backend', 'config'), 'utf-8')).toBe('existing')
+    expect(existsSync(join(projectDir, '.git', 'modules', 'frontend'))).toBe(false)
+  })
+
   test('restores origin and upstream remotes for project, backend, and frontend dirs', async () => {
     const projectDir = makeTempDir()
     const backendDir = makeTempDir()
@@ -175,5 +261,120 @@ describe('repo init transaction', () => {
     expect(remoteUrls.get(remoteKey(frontendDir, 'upstream'))).toBe(
       'https://example.test/original/frontend-upstream.git',
     )
+  })
+
+  test('does not snapshot or restore child remotes when child directories are not Git roots', async () => {
+    const projectDir = makeTempDir()
+    const backendDir = join(projectDir, 'backend')
+    const frontendDir = join(projectDir, 'frontend')
+    dirs.push(projectDir)
+    mkdirSync(backendDir, { recursive: true })
+    mkdirSync(frontendDir, { recursive: true })
+    setRemote(projectDir, 'origin', 'https://example.test/original/project.git')
+    isGitRepoRootMock.mockImplementation(async (dir: string) => dir === projectDir)
+
+    const snapshot = await createRepoInitSnapshot({ projectDir, backendDir, frontendDir })
+    setRemote(projectDir, 'origin', 'https://example.test/changed/project.git')
+    writeFileSync(join(backendDir, '.git'), 'gitdir: ../.git/modules/backend', 'utf-8')
+    writeFileSync(join(backendDir, 'created.txt'), 'created during init', 'utf-8')
+    writeFileSync(join(frontendDir, '.git'), 'gitdir: ../.git/modules/frontend', 'utf-8')
+    writeFileSync(join(frontendDir, 'created.txt'), 'created during init', 'utf-8')
+
+    await restoreRepoInitSnapshot(snapshot)
+
+    expect(getRemoteUrlMock).toHaveBeenCalledWith(projectDir, 'origin')
+    expect(getRemoteUrlMock).not.toHaveBeenCalledWith(backendDir, 'origin')
+    expect(getRemoteUrlMock).not.toHaveBeenCalledWith(frontendDir, 'origin')
+    expect(ensureRemoteMock).toHaveBeenCalledWith(
+      projectDir,
+      'origin',
+      'https://example.test/original/project.git',
+    )
+    expect(ensureRemoteMock).not.toHaveBeenCalledWith(
+      backendDir,
+      expect.any(String),
+      expect.any(String),
+    )
+    expect(removeRemoteMock).not.toHaveBeenCalledWith(backendDir, expect.any(String))
+    expect(checkoutExistingBranchMock).not.toHaveBeenCalledWith(backendDir, expect.any(String))
+    expect(checkoutDetachedMock).not.toHaveBeenCalledWith(frontendDir, expect.any(String))
+    expect(readdirSync(backendDir)).toEqual([])
+    expect(readdirSync(frontendDir)).toEqual([])
+  })
+
+  test('preserves pre-existing non-empty non-Git child directories during rollback', async () => {
+    const projectDir = makeTempDir()
+    const backendDir = join(projectDir, 'backend')
+    const frontendDir = join(projectDir, 'frontend')
+    dirs.push(projectDir)
+    mkdirSync(backendDir, { recursive: true })
+    mkdirSync(frontendDir, { recursive: true })
+    writeFileSync(join(backendDir, 'keep.txt'), 'user backend data', 'utf-8')
+    writeFileSync(join(frontendDir, 'keep.txt'), 'user frontend data', 'utf-8')
+    isGitRepoRootMock.mockImplementation(async (dir: string) => dir === projectDir)
+
+    const snapshot = await createRepoInitSnapshot({ projectDir, backendDir, frontendDir })
+    writeFileSync(join(backendDir, '.git'), 'gitdir: ../.git/modules/backend', 'utf-8')
+    writeFileSync(join(backendDir, 'created.txt'), 'created during init', 'utf-8')
+    writeFileSync(join(frontendDir, '.git'), 'gitdir: ../.git/modules/frontend', 'utf-8')
+    writeFileSync(join(frontendDir, 'created.txt'), 'created during init', 'utf-8')
+
+    await restoreRepoInitSnapshot(snapshot)
+
+    expect(readFileSync(join(backendDir, 'keep.txt'), 'utf-8')).toBe('user backend data')
+    expect(readFileSync(join(frontendDir, 'keep.txt'), 'utf-8')).toBe('user frontend data')
+    expect(existsSync(join(backendDir, 'created.txt'))).toBe(true)
+    expect(existsSync(join(frontendDir, 'created.txt'))).toBe(true)
+  })
+
+  test('does not deinitialize existing submodules whose section names differ from paths', async () => {
+    const projectDir = makeTempDir()
+    const backendDir = join(projectDir, 'backend')
+    const frontendDir = join(projectDir, 'frontend')
+    dirs.push(projectDir)
+    mkdirSync(join(projectDir, '.git', 'modules', 'api'), { recursive: true })
+    mkdirSync(join(projectDir, '.git', 'modules', 'frontend'), { recursive: true })
+    writeFileSync(join(projectDir, '.gitmodules'), [
+      '[submodule "api"]',
+      '\tpath = backend',
+      '\turl = https://github.com/acme/backend.git',
+      '[submodule "frontend"]',
+      '\tpath = frontend',
+      '\turl = https://github.com/acme/frontend.git',
+      '',
+    ].join('\n'), 'utf-8')
+
+    const snapshot = await createRepoInitSnapshot({ projectDir, backendDir, frontendDir })
+    mkdirSync(join(projectDir, '.git', 'modules', 'backend'), { recursive: true })
+
+    await restoreRepoInitSnapshot(snapshot)
+
+    expect(deinitSubmodulesMock).not.toHaveBeenCalledWith(projectDir, ['backend'])
+    expect(deinitSubmodulesMock).not.toHaveBeenCalledWith(projectDir, ['backend', 'frontend'])
+    expect(existsSync(join(projectDir, '.git', 'modules', 'api'))).toBe(true)
+  })
+
+  test('removes path-named metadata created beside an existing renamed submodule', async () => {
+    const projectDir = makeTempDir()
+    const backendDir = join(projectDir, 'backend')
+    const frontendDir = join(projectDir, 'frontend')
+    dirs.push(projectDir)
+    mkdirSync(join(projectDir, '.git', 'modules', 'api'), { recursive: true })
+    writeFileSync(join(projectDir, '.gitmodules'), [
+      '[submodule "api"]',
+      '\tpath = backend',
+      '\turl = https://github.com/acme/backend.git',
+      '',
+    ].join('\n'), 'utf-8')
+
+    const snapshot = await createRepoInitSnapshot({ projectDir, backendDir, frontendDir })
+    mkdirSync(join(projectDir, '.git', 'modules', 'backend'), { recursive: true })
+    writeFileSync(join(projectDir, '.git', 'modules', 'backend', 'config'), 'created', 'utf-8')
+
+    await restoreRepoInitSnapshot(snapshot)
+
+    expect(deinitSubmodulesMock).not.toHaveBeenCalledWith(projectDir, ['backend'])
+    expect(existsSync(join(projectDir, '.git', 'modules', 'api'))).toBe(true)
+    expect(existsSync(join(projectDir, '.git', 'modules', 'backend'))).toBe(false)
   })
 })

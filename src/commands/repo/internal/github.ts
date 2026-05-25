@@ -20,6 +20,7 @@ export interface CreateRepositoryInput {
 }
 
 type FetchLike = typeof ofetch
+const GITHUB_API_TIMEOUT = 30000
 
 export function parseGitHubHttpsUrl(url: string): GitHubRepoRef | null {
   let parsed: URL
@@ -32,13 +33,18 @@ export function parseGitHubHttpsUrl(url: string): GitHubRepoRef | null {
   if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'github.com') {
     return null
   }
+  if (parsed.username || parsed.password) return null
+  if (parsed.search || parsed.hash) return null
 
   const parts = parsed.pathname.replace(/^\/+|\/+$/g, '').split('/')
   if (parts.length !== 2 || !parts[0] || !parts[1]) return null
 
-  const owner = parts[0]
-  const repo = parts[1].replace(/\.git$/i, '')
-  if (!repo) return null
+  const owner = safeDecodeURIComponent(parts[0])
+  const repoWithSuffix = safeDecodeURIComponent(parts[1])
+  if (!owner || !repoWithSuffix) return null
+
+  const repo = repoWithSuffix.replace(/\.git$/i, '')
+  if (!isValidGitHubOwner(owner) || !isValidGitHubRepoName(repo)) return null
 
   return {
     owner,
@@ -47,10 +53,27 @@ export function parseGitHubHttpsUrl(url: string): GitHubRepoRef | null {
   }
 }
 
+function safeDecodeURIComponent(value: string): string | null {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return null
+  }
+}
+
+function isValidGitHubOwner(owner: string): boolean {
+  return /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(owner)
+}
+
+function isValidGitHubRepoName(repo: string): boolean {
+  return /^[A-Za-z0-9._-]+$/.test(repo) && repo !== '.' && repo !== '..'
+}
+
 export function createGitHubClient(token: string, fetcher: FetchLike = ofetch) {
   const request = <T>(path: string, options: Record<string, unknown> = {}) =>
     fetcher<T>(path, {
       baseURL: 'https://api.github.com',
+      timeout: GITHUB_API_TIMEOUT,
       headers: {
         Accept: 'application/vnd.github+json',
         Authorization: `Bearer ${token}`,

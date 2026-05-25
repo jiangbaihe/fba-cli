@@ -1,5 +1,7 @@
-import { beforeEach, describe, expect, mock, test } from 'bun:test'
-import { resolve } from 'path'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { mkdirSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join, resolve } from 'path'
 
 const runMock = mock(async () => ({ stdout: '', stderr: '', exitCode: 0 }))
 
@@ -23,25 +25,51 @@ const {
   getAheadBehind,
   getConflictedPaths,
   getCurrentBranch,
+  getMissingSubmoduleGitlinkPaths,
+  getSubmoduleCommitsInMainRange,
+  getHeadCommit,
+  checkoutBranch,
+  checkoutDetached,
+  checkoutExistingBranch,
+  checkoutNewBranchAtHead,
+  deleteLocalBranch,
   getPorcelainStatus,
+  hasLocalCommitsOnOrigin,
+  hasSubmodulePointerChange,
+  isCommitOnHead,
+  isCommitPushed,
+  isSubmoduleCommitOnHead,
+  isSubmoduleCommitPushed,
   getRemoteBranchRef,
   getRemoteUrl,
+  deinitSubmodules,
   initGitRepo,
+  initSubmodules,
   isGitRepo,
   isGitRepoRoot,
   isShallowRepo,
+  listLocalBranches,
   listRemoteBranches,
   mergeRef,
   removeRemote,
   pushCurrentBranch,
   rebaseOnto,
   stagePaths,
+  unstagePaths,
   unshallowRepo,
 } = await import('../src/commands/repo/internal/git.ts')
 
 describe('git-repo helpers', () => {
+  const dirs: string[] = []
+
   beforeEach(() => {
-    runMock.mockClear()
+    runMock.mockReset()
+    runMock.mockImplementation(async () => ({ stdout: '', stderr: '', exitCode: 0 }))
+  })
+
+  afterEach(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true })
+    dirs.length = 0
   })
 
   test('detects git repositories', async () => {
@@ -65,6 +93,12 @@ describe('git-repo helpers', () => {
     expect(runMock).toHaveBeenCalledWith('git', ['clone', 'https://example.test/repo.git', 'target-dir'], {
       spinner: true,
       label: 'Full clone',
+      timeout: 300000,
+      env: {
+        GIT_TERMINAL_PROMPT: '0',
+        GCM_INTERACTIVE: 'never',
+        GIT_EDITOR: 'true',
+      },
     })
   })
 
@@ -146,17 +180,108 @@ describe('git-repo helpers', () => {
     })
   })
 
+  test('detects git repository roots accessed through real filesystem aliases', async () => {
+    const root = join(tmpdir(), `fba-repo-root-alias-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+    const target = join(root, 'target')
+    const link = join(root, 'link')
+    mkdirSync(target, { recursive: true })
+    dirs.push(root)
+    if (process.platform === 'win32') {
+      await import('fs').then(({ symlinkSync }) => symlinkSync(target, link, 'junction'))
+    } else {
+      await import('fs').then(({ symlinkSync }) => symlinkSync(target, link, 'dir'))
+    }
+    runMock.mockResolvedValueOnce({ stdout: `${target}\n`, stderr: '', exitCode: 0 })
+
+    await expect(isGitRepoRoot(link)).resolves.toBe(true)
+  })
+
+  test('reads the current HEAD commit for rollback snapshots', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: '0123456789abcdef0123456789abcdef01234567\n', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: 'fatal: bad revision', exitCode: 128 })
+
+    await expect(getHeadCommit('repo')).resolves.toBe('0123456789abcdef0123456789abcdef01234567')
+    await expect(getHeadCommit('repo')).resolves.toBeNull()
+    expect(runMock).toHaveBeenNthCalledWith(1, 'git', ['rev-parse', '--verify', 'HEAD'], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+  })
+
+  test('checks out a local branch from origin when repairing detached child repos', async () => {
+    runMock.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
+    await expect(checkoutBranch('repo', 'main', 'origin/main')).resolves.toBe(true)
+    expect(runMock).toHaveBeenCalledWith('git', ['checkout', '-B', 'main', 'origin/main'], {
+      cwd: 'repo',
+      spinner: true,
+      label: 'Checking out main',
+      timeout: 30000,
+    })
+  })
+
+  test('checks out existing branches and detached commits for init rollback', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
+    await expect(checkoutExistingBranch('repo', 'main')).resolves.toBe(true)
+    await expect(checkoutDetached('repo', '0123456789abcdef0123456789abcdef01234567')).resolves.toBe(true)
+
+    expect(runMock).toHaveBeenNthCalledWith(1, 'git', ['checkout', 'main'], {
+      cwd: 'repo',
+      spinner: true,
+      label: 'Checking out main',
+      timeout: 30000,
+    })
+    expect(runMock).toHaveBeenNthCalledWith(2, 'git', [
+      'checkout',
+      '--detach',
+      '0123456789abcdef0123456789abcdef01234567',
+    ], {
+      cwd: 'repo',
+      spinner: true,
+      label: 'Restoring detached HEAD',
+      timeout: 30000,
+    })
+  })
+
+  test('creates a local branch at the current child HEAD without moving commits', async () => {
+    runMock.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
+    await expect(checkoutNewBranchAtHead('repo', 'main')).resolves.toBe(true)
+    expect(runMock).toHaveBeenCalledWith('git', ['checkout', '-b', 'main'], {
+      cwd: 'repo',
+      spinner: true,
+      label: 'Checking out main',
+      timeout: 30000,
+    })
+  })
+
+  test('deletes local branches created during init rollback', async () => {
+    runMock.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
+    await expect(deleteLocalBranch('repo', 'fba-repo-main')).resolves.toBe(true)
+    expect(runMock).toHaveBeenCalledWith('git', ['branch', '-D', 'fba-repo-main'], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+  })
+
   test('dry-runs current branch push without mutating remotes', async () => {
     runMock.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
 
     await expect(dryRunPushCurrentBranch('repo', 'main')).resolves.toBe(true)
     expect(runMock).toHaveBeenCalledWith(
       'git',
-      ['push', '--dry-run', 'origin', 'HEAD:main'],
+      ['push', '--dry-run', '--no-follow-tags', 'origin', 'HEAD:main'],
       {
         cwd: 'repo',
         stdio: 'pipe',
-        timeout: 30000,
+        timeout: 300000,
         env: {
           GIT_TERMINAL_PROMPT: '0',
           GCM_INTERACTIVE: 'never',
@@ -172,12 +297,12 @@ describe('git-repo helpers', () => {
     await expect(pushCurrentBranch('repo', 'main')).resolves.toBe(true)
     expect(runMock).toHaveBeenCalledWith(
       'git',
-      ['push', '-u', 'origin', 'HEAD:main'],
+      ['push', '--no-follow-tags', '-u', 'origin', 'HEAD:main'],
       {
         cwd: 'repo',
         spinner: true,
         label: 'Pushing main',
-        timeout: 30000,
+        timeout: 300000,
         env: {
           GIT_TERMINAL_PROMPT: '0',
           GCM_INTERACTIVE: 'never',
@@ -221,13 +346,35 @@ describe('git-repo helpers', () => {
       cwd: 'repo',
       spinner: true,
       label: 'Fetching origin',
-      timeout: 30000,
+      timeout: 300000,
       env: {
         GIT_TERMINAL_PROMPT: '0',
         GCM_INTERACTIVE: 'never',
         GIT_EDITOR: 'true',
       },
     })
+  })
+
+  test('passes GitHub tokens to network git operations through temporary config', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
+    await expect(fetchRemote('repo', 'origin', { authToken: 'github-token' })).resolves.toBe(true)
+    await expect(dryRunPushCurrentBranch('repo', 'main', { authToken: 'github-token' })).resolves.toBe(true)
+    await expect(pushCurrentBranch('repo', 'main', { authToken: 'github-token' })).resolves.toBe(true)
+
+    for (const call of runMock.mock.calls) {
+      const args = call[1]
+      expect(args).not.toContain('github-token')
+      expect(call[2].env).toMatchObject({
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+      })
+      expect(call[2].env.GIT_CONFIG_VALUE_0).toStartWith('AUTHORIZATION: basic ')
+      expect(call[2].env.GIT_CONFIG_VALUE_0).not.toContain('github-token')
+    }
   })
 
   test('returns false when origin fetch fails', async () => {
@@ -272,6 +419,184 @@ describe('git-repo helpers', () => {
     )
   })
 
+  test('detects local commits that already exist on origin branches', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: '1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222\n', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '  origin/feature\n', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '  origin/feature\n', stderr: '', exitCode: 0 })
+
+    await expect(hasLocalCommitsOnOrigin('repo', 'main')).resolves.toBe(true)
+    expect(runMock).toHaveBeenCalledWith('git', ['rev-list', 'origin/main..HEAD'], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+    expect(runMock).toHaveBeenCalledWith(
+      'git',
+      ['branch', '-r', '--contains', '1111111111111111111111111111111111111111', '--list', 'origin/*'],
+      {
+        cwd: 'repo',
+        stdio: 'pipe',
+        showErrorOutput: false,
+      },
+    )
+  })
+
+  test('reads submodule commits from every main commit that will be pushed', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: 'origin-main\n', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({
+        stdout: [
+          'commit-two',
+          'commit-one',
+          '',
+        ].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      })
+      .mockResolvedValueOnce({
+        stdout: [
+          '160000 commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tbackend',
+          '160000 commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tfrontend',
+          '',
+        ].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      })
+      .mockResolvedValueOnce({
+        stdout: [
+          '160000 commit cccccccccccccccccccccccccccccccccccccccc\tbackend',
+          '160000 commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tfrontend',
+          '',
+        ].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      })
+
+    await expect(getSubmoduleCommitsInMainRange(
+      'repo',
+      'main',
+      ['backend', 'frontend'],
+    )).resolves.toEqual({
+      backend: [
+        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        'cccccccccccccccccccccccccccccccccccccccc',
+      ],
+      frontend: ['bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'],
+    })
+    expect(runMock).toHaveBeenNthCalledWith(1, 'git', ['rev-parse', '--verify', 'origin/main'], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+    expect(runMock).toHaveBeenNthCalledWith(2, 'git', ['rev-list', 'origin/main..HEAD'], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+    expect(runMock).toHaveBeenNthCalledWith(3, 'git', [
+      'ls-tree',
+      'commit-two',
+      '--',
+      'backend',
+      'frontend',
+    ], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+  })
+
+  test('reads submodule commits from HEAD when the main origin branch is missing', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: '', stderr: 'fatal: Needed a single revision', exitCode: 128 })
+      .mockResolvedValueOnce({
+        stdout: [
+          'commit-one',
+          '',
+        ].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      })
+      .mockResolvedValueOnce({
+        stdout: [
+          '160000 commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tbackend',
+          '',
+        ].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      })
+
+    await expect(getSubmoduleCommitsInMainRange(
+      'repo',
+      'main',
+      ['backend'],
+    )).resolves.toEqual({
+      backend: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+    })
+    expect(runMock).toHaveBeenNthCalledWith(1, 'git', ['rev-parse', '--verify', 'origin/main'], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+    expect(runMock).toHaveBeenNthCalledWith(2, 'git', ['rev-list', 'HEAD'], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+  })
+
+  test('reports paths without HEAD submodule gitlinks', async () => {
+    runMock.mockResolvedValueOnce({
+      stdout: [
+        '160000 commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tbackend',
+        '100644 blob bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tfrontend',
+        '',
+      ].join('\n'),
+      stderr: '',
+      exitCode: 0,
+    })
+
+    await expect(getMissingSubmoduleGitlinkPaths('repo', ['backend', 'frontend']))
+      .resolves.toEqual(['frontend'])
+    expect(runMock).toHaveBeenCalledWith('git', ['ls-tree', 'HEAD', '--', 'backend', 'frontend'], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+  })
+
+  test('returns null when HEAD submodule gitlinks cannot be read', async () => {
+    runMock.mockResolvedValueOnce({ stdout: '', stderr: 'fatal: bad revision', exitCode: 128 })
+
+    await expect(getMissingSubmoduleGitlinkPaths('repo', ['backend'])).resolves.toBeNull()
+  })
+
+  test('returns null when submodule commits in the main push range cannot be read', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: 'origin-main\n', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: 'bad revision', exitCode: 128 })
+
+    await expect(getSubmoduleCommitsInMainRange('repo', 'main', ['backend'])).resolves.toBeNull()
+  })
+
+  test('treats partially published local commits as rebase-unsafe', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: '1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222\n', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '  origin/feature\n', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
+    await expect(hasLocalCommitsOnOrigin('repo', 'main')).resolves.toBe(true)
+  })
+
+  test('returns false when local commits are not found on origin branches', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: '1111111111111111111111111111111111111111\n', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
+    await expect(hasLocalCommitsOnOrigin('repo', 'main')).resolves.toBe(false)
+  })
+
   test('fast-forwards current branch from origin non-interactively', async () => {
     runMock.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
 
@@ -312,7 +637,7 @@ describe('git-repo helpers', () => {
       cwd: 'repo',
       spinner: true,
       label: 'Fetching upstream',
-      timeout: 30000,
+      timeout: 300000,
       env: {
         GIT_TERMINAL_PROMPT: '0',
         GCM_INTERACTIVE: 'never',
@@ -361,33 +686,41 @@ describe('git-repo helpers', () => {
     runMock
       .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
       .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
 
     await expect(checkoutConflictSide('repo', 'ours', ['a.ts', 'dir/b.ts'])).resolves.toBe(true)
     await expect(stagePaths('repo', ['a.ts'])).resolves.toBe(true)
+    await expect(unstagePaths('repo', ['a.ts'])).resolves.toBe(true)
 
     expect(runMock).toHaveBeenNthCalledWith(1, 'git', ['checkout', '--ours', '--', 'a.ts', 'dir/b.ts'], expect.objectContaining({ cwd: 'repo' }))
     expect(runMock).toHaveBeenNthCalledWith(2, 'git', ['add', '--', 'a.ts'], expect.objectContaining({ cwd: 'repo' }))
+    expect(runMock).toHaveBeenNthCalledWith(3, 'git', ['reset', '--', 'a.ts'], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
   })
 
-  test('parses conflicted paths from porcelain status', async () => {
+  test('parses conflicted paths with git z output', async () => {
     runMock.mockResolvedValueOnce({
       stdout: [
-        'UU src/a.ts',
-        'AA src/b.ts',
-        ' M clean.ts',
-        '?? new.ts',
-        'DU deleted-by-us.ts',
-      ].join('\n'),
+        'src/a b.ts',
+        'src/"quoted".ts',
+        ' leading-and-trailing-space.ts ',
+        'deleted-by-us.ts',
+        '',
+      ].join('\0'),
       stderr: '',
       exitCode: 0,
     })
 
     await expect(getConflictedPaths('repo')).resolves.toEqual([
-      'src/a.ts',
-      'src/b.ts',
+      'src/a b.ts',
+      'src/"quoted".ts',
+      ' leading-and-trailing-space.ts ',
       'deleted-by-us.ts',
     ])
-    expect(runMock).toHaveBeenCalledWith('git', ['status', '--porcelain'], {
+    expect(runMock).toHaveBeenCalledWith('git', ['diff', '--name-only', '--diff-filter=U', '-z'], {
       cwd: 'repo',
       stdio: 'pipe',
       showErrorOutput: false,
@@ -407,6 +740,24 @@ describe('git-repo helpers', () => {
 
     await expect(listRemoteBranches('repo', 'upstream')).resolves.toEqual(['dev', 'main'])
     expect(runMock).toHaveBeenCalledWith('git', ['branch', '-r', '--list', 'upstream/*'], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+  })
+
+  test('lists local branch names', async () => {
+    runMock.mockResolvedValueOnce({
+      stdout: [
+        '* main',
+        '  feature/repo-work',
+      ].join('\n'),
+      stderr: '',
+      exitCode: 0,
+    })
+
+    await expect(listLocalBranches('repo')).resolves.toEqual(['main', 'feature/repo-work'])
+    expect(runMock).toHaveBeenCalledWith('git', ['branch', '--list'], {
       cwd: 'repo',
       stdio: 'pipe',
       showErrorOutput: false,
@@ -515,6 +866,12 @@ describe('git-repo helpers', () => {
       cwd: 'repo',
       spinner: true,
       label: 'Fetching full git history',
+      timeout: 300000,
+      env: {
+        GIT_TERMINAL_PROMPT: '0',
+        GCM_INTERACTIVE: 'never',
+        GIT_EDITOR: 'true',
+      },
     })
   })
 
@@ -532,6 +889,212 @@ describe('git-repo helpers', () => {
       cwd: 'repo',
       stdio: 'pipe',
     })
+  })
+
+  test('distinguishes real submodule pointer changes from dirty submodule worktrees', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 1 })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: 'fatal: bad pathspec', exitCode: 128 })
+
+    await expect(hasSubmodulePointerChange('repo', 'backend')).resolves.toBe(true)
+    await expect(hasSubmodulePointerChange('repo', 'backend')).resolves.toBe(false)
+    await expect(hasSubmodulePointerChange('repo', 'backend')).resolves.toBeNull()
+
+    expect(runMock).toHaveBeenNthCalledWith(
+      1,
+      'git',
+      ['diff', '--quiet', '--ignore-submodules=dirty', '--', 'backend'],
+      {
+        cwd: 'repo',
+        stdio: 'pipe',
+        showErrorOutput: false,
+      },
+    )
+  })
+
+  test('detects staged-only submodule pointer changes', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 1 })
+
+    await expect(hasSubmodulePointerChange('repo', 'backend')).resolves.toBe(true)
+    expect(runMock).toHaveBeenNthCalledWith(
+      2,
+      'git',
+      ['diff', '--cached', '--quiet', '--ignore-submodules=dirty', '--', 'backend'],
+      {
+        cwd: 'repo',
+        stdio: 'pipe',
+        showErrorOutput: false,
+      },
+    )
+  })
+
+  test('checks whether the main gitlink commit exists on the child origin', async () => {
+    runMock
+      .mockResolvedValueOnce({
+        stdout: '160000 commit 0123456789abcdef0123456789abcdef01234567\tbackend\n',
+        stderr: '',
+        exitCode: 0,
+      })
+      .mockResolvedValueOnce({
+        stdout: '  origin/main\n',
+        stderr: '',
+        exitCode: 0,
+      })
+
+    await expect(isSubmoduleCommitPushed('repo', 'backend')).resolves.toBe(true)
+    expect(runMock).toHaveBeenNthCalledWith(1, 'git', ['ls-tree', 'HEAD', '--', 'backend'], {
+      cwd: 'repo',
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+    expect(runMock).toHaveBeenNthCalledWith(
+      2,
+      'git',
+      ['branch', '-r', '--contains', '0123456789abcdef0123456789abcdef01234567', '--list', 'origin/*'],
+      expect.objectContaining({ cwd: resolve('repo', 'backend') }),
+    )
+  })
+
+  test('returns false when the main gitlink commit is not on the child origin', async () => {
+    runMock
+      .mockResolvedValueOnce({
+        stdout: '160000 commit 0123456789abcdef0123456789abcdef01234567\tbackend\n',
+        stderr: '',
+        exitCode: 0,
+      })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
+    await expect(isSubmoduleCommitPushed('repo', 'backend')).resolves.toBe(false)
+  })
+
+  test('checks arbitrary commits against child origin branches', async () => {
+    runMock.mockResolvedValueOnce({
+      stdout: '  origin/main\n',
+      stderr: '',
+      exitCode: 0,
+    })
+
+    await expect(isCommitPushed('repo', 'backend', '0123456789abcdef0123456789abcdef01234567'))
+      .resolves.toBe(true)
+    expect(runMock).toHaveBeenCalledWith(
+      'git',
+      ['branch', '-r', '--contains', '0123456789abcdef0123456789abcdef01234567', '--list', 'origin/*'],
+      expect.objectContaining({ cwd: resolve('repo', 'backend') }),
+    )
+  })
+
+  test('checks whether the main gitlink commit is included in the child HEAD', async () => {
+    runMock
+      .mockResolvedValueOnce({
+        stdout: '160000 commit 0123456789abcdef0123456789abcdef01234567\tbackend\n',
+        stderr: '',
+        exitCode: 0,
+      })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({
+        stdout: '160000 commit 89abcdef0123456789abcdef0123456789abcdef\tbackend\n',
+        stderr: '',
+        exitCode: 0,
+      })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 1 })
+
+    await expect(isSubmoduleCommitOnHead('repo', 'backend')).resolves.toBe(true)
+    await expect(isSubmoduleCommitOnHead('repo', 'backend')).resolves.toBe(false)
+
+    expect(runMock).toHaveBeenNthCalledWith(2, 'git', [
+      'merge-base',
+      '--is-ancestor',
+      '0123456789abcdef0123456789abcdef01234567',
+      'HEAD',
+    ], {
+      cwd: resolve('repo', 'backend'),
+      stdio: 'pipe',
+      showErrorOutput: false,
+    })
+  })
+
+  test('returns null when the main gitlink commit cannot be checked against child HEAD', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({
+        stdout: '160000 commit 0123456789abcdef0123456789abcdef01234567\tbackend\n',
+        stderr: '',
+        exitCode: 0,
+      })
+      .mockResolvedValueOnce({ stdout: '', stderr: 'fatal: not a repo', exitCode: 128 })
+
+    await expect(isSubmoduleCommitOnHead('repo', 'backend')).resolves.toBeNull()
+    await expect(isSubmoduleCommitOnHead('repo', 'backend')).resolves.toBeNull()
+  })
+
+  test('checks arbitrary commits against child HEAD', async () => {
+    runMock.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
+    await expect(isCommitOnHead('repo', 'backend', '0123456789abcdef0123456789abcdef01234567'))
+      .resolves.toBe(true)
+    expect(runMock).toHaveBeenCalledWith('git', [
+      'merge-base',
+      '--is-ancestor',
+      '0123456789abcdef0123456789abcdef01234567',
+      'HEAD',
+    ], expect.objectContaining({ cwd: resolve('repo', 'backend') }))
+  })
+
+  test('syncs configured submodule URLs before initializing requested submodules', async () => {
+    runMock
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
+    await expect(initSubmodules('repo', ['backend', 'frontend'])).resolves.toBe(true)
+    expect(runMock).toHaveBeenCalledWith(
+      'git',
+      ['submodule', 'sync', '--', 'backend', 'frontend'],
+      {
+        cwd: 'repo',
+        stdio: 'pipe',
+        timeout: 300000,
+        env: {
+          GIT_TERMINAL_PROMPT: '0',
+          GCM_INTERACTIVE: 'never',
+          GIT_EDITOR: 'true',
+        },
+      },
+    )
+    expect(runMock).toHaveBeenCalledWith(
+      'git',
+      ['submodule', 'update', '--init', '--checkout', '--', 'backend', 'frontend'],
+      {
+        cwd: 'repo',
+        spinner: true,
+        label: 'Initializing child repositories',
+        timeout: 300000,
+        env: {
+          GIT_TERMINAL_PROMPT: '0',
+          GCM_INTERACTIVE: 'never',
+          GIT_EDITOR: 'true',
+        },
+      },
+    )
+  })
+
+  test('deinitializes requested submodules during init rollback cleanup', async () => {
+    runMock.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+
+    await expect(deinitSubmodules('repo', ['backend', 'frontend'])).resolves.toBe(true)
+    expect(runMock).toHaveBeenCalledWith(
+      'git',
+      ['submodule', 'deinit', '-f', '--', 'backend', 'frontend'],
+      {
+        cwd: 'repo',
+        stdio: 'pipe',
+        showErrorOutput: false,
+      },
+    )
   })
 
   test('returns false when git init fails', async () => {

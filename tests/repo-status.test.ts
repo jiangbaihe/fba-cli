@@ -143,6 +143,7 @@ describe('repo status helpers', () => {
       isShallow: false,
       originUrl: null,
       upstreamUrl: null,
+      currentBranch: null,
       expectedUpstreamUrl: 'https://github.com/fastapi-practices/fastapi-best-architecture.git',
       porcelainStatus: null,
     })).toEqual([
@@ -161,6 +162,7 @@ describe('repo status helpers', () => {
       isShallow: false,
       originUrl: 'https://github.com/acme/server.git',
       upstreamUrl: 'https://github.com/fastapi-practices/fastapi-best-architecture.git',
+      currentBranch: 'main',
       expectedUpstreamUrl: 'https://github.com/fastapi-practices/fastapi-best-architecture.git',
       porcelainStatus: [],
     })
@@ -186,6 +188,7 @@ describe('repo status helpers', () => {
       isShallow: true,
       originUrl: null,
       upstreamUrl: 'https://github.com/example/wrong-upstream.git',
+      currentBranch: null,
       expectedUpstreamUrl: 'https://github.com/fastapi-practices/fastapi-best-architecture-ui.git',
       porcelainStatus: [' M package.json', '?? tmp.txt'],
     })
@@ -200,12 +203,84 @@ describe('repo status helpers', () => {
       level: 'warn',
     }))
     expect(checks).toContainEqual(expect.objectContaining({
+      code: 'frontend.branch',
+      level: 'warn',
+    }))
+    expect(checks).toContainEqual(expect.objectContaining({
       code: 'frontend.upstream',
       level: 'warn',
     }))
     expect(checks).toContainEqual(expect.objectContaining({
       code: 'frontend.workingTree',
       level: 'warn',
+    }))
+  })
+
+  test('blocks repo init suggestions for non-empty child directories that are not Git repositories', () => {
+    const checks = assessRepository({
+      role: 'backend',
+      label: 'Backend',
+      exists: true,
+      isGitRepo: false,
+      isGitRoot: false,
+      isEmptyDirectory: false,
+      isShallow: false,
+      originUrl: null,
+      upstreamUrl: null,
+      currentBranch: null,
+      expectedUpstreamUrl: 'https://github.com/fastapi-practices/fastapi-best-architecture.git',
+      porcelainStatus: null,
+    })
+
+    expect(checks).toContainEqual(expect.objectContaining({
+      code: 'backend.dirContent',
+      level: 'error',
+    }))
+    expect(getRecommendedStatusActions(checks)).toEqual([])
+  })
+
+  test('warns when the main repository has an upstream remote', () => {
+    const checks = assessRepository({
+      role: 'main',
+      label: 'Main',
+      exists: true,
+      isGitRepo: true,
+      isGitRoot: true,
+      isShallow: false,
+      originUrl: 'https://github.com/acme/demo.git',
+      upstreamUrl: 'https://github.com/acme/unexpected.git',
+      currentBranch: 'main',
+      expectedUpstreamUrl: undefined,
+      porcelainStatus: [],
+    })
+
+    expect(checks).toContainEqual(expect.objectContaining({
+      code: 'main.upstream',
+      level: 'warn',
+    }))
+  })
+
+  test('redacts credentials from displayed remote URLs', () => {
+    const checks = assessRepository({
+      role: 'main',
+      label: 'Main',
+      exists: true,
+      isGitRepo: true,
+      isGitRoot: true,
+      isShallow: false,
+      originUrl: 'https://ghp_secret@github.com/acme/demo.git',
+      upstreamUrl: 'https://user:token@github.com/acme/upstream.git',
+      currentBranch: 'main',
+      porcelainStatus: [],
+    })
+
+    expect(checks).toContainEqual(expect.objectContaining({
+      code: 'main.origin',
+      detail: 'https://***@github.com/acme/demo.git',
+    }))
+    expect(checks).toContainEqual(expect.objectContaining({
+      code: 'main.upstream',
+      detail: 'https://***@github.com/acme/upstream.git',
     }))
   })
 
@@ -222,6 +297,73 @@ describe('repo status helpers', () => {
     expect(getRecommendedStatusActions([
       { code: 'main.shallow', level: 'warn', message: 'main shallow clone' },
     ])).toEqual([])
+
+    expect(getRecommendedStatusActions([
+      { code: 'main.branch', level: 'warn', message: 'main detached head' },
+    ])).toEqual([])
+
+    expect(getRecommendedStatusActions([
+      { code: 'main.upstream', level: 'warn', message: 'main has upstream' },
+    ])).toEqual([])
+
+    expect(getRecommendedStatusActions([
+      { code: 'backend.branch', level: 'warn', message: 'backend detached head' },
+    ])).toEqual(['init'])
+
+    expect(getRecommendedStatusActions([
+      { code: 'backend.dir', level: 'error', message: 'missing backend' },
+      { code: 'frontend.git', level: 'error', message: 'frontend is not a git repo' },
+    ])).toEqual(['init'])
+
+    expect(getRecommendedStatusActions([
+      { code: 'backend.dirContent', level: 'error', message: 'backend is not an empty Git root' },
+    ])).toEqual([])
+
+    expect(getRecommendedStatusActions([
+      { code: 'main.git', level: 'error', message: 'main is not a git repo' },
+      { code: 'backend.dir', level: 'error', message: 'missing backend' },
+    ])).toEqual([])
+
+    expect(getRecommendedStatusActions([
+      { code: 'backend.dir', level: 'error', message: 'missing backend' },
+      { code: 'frontend.dir', level: 'error', message: 'missing frontend' },
+      { code: 'gitmodules.file', level: 'warn', message: 'missing .gitmodules' },
+    ])).toEqual([])
+
+    expect(getRecommendedStatusActions([
+      { code: 'main.git', level: 'ok', message: 'main is a git repo' },
+      { code: 'main.root', level: 'ok', message: 'main is a git root' },
+      { code: 'backend.git', level: 'ok', message: 'backend is a git repo' },
+      { code: 'backend.root', level: 'ok', message: 'backend is a git root' },
+      { code: 'backend.origin', level: 'ok', message: 'backend has origin' },
+      { code: 'frontend.git', level: 'ok', message: 'frontend is a git repo' },
+      { code: 'frontend.root', level: 'ok', message: 'frontend is a git root' },
+      { code: 'frontend.origin', level: 'ok', message: 'frontend has origin' },
+      { code: 'gitmodules.file', level: 'warn', message: 'missing .gitmodules' },
+    ])).toEqual(['init'])
+
+    expect(getRecommendedStatusActions([
+      { code: 'main.git', level: 'ok', message: 'main is a git repo' },
+      { code: 'main.root', level: 'ok', message: 'main is a git root' },
+      { code: 'backend.dir', level: 'error', message: 'missing backend' },
+      { code: 'frontend.dir', level: 'error', message: 'missing frontend' },
+      { code: 'gitmodules.file', level: 'warn', message: 'missing .gitmodules' },
+    ])).toEqual([])
+
+    expect(getRecommendedStatusActions([
+      { code: 'backend.dir', level: 'error', message: 'missing backend' },
+      { code: 'gitmodules.backend.entry', level: 'warn', message: 'missing backend entry' },
+    ])).toEqual([])
+
+    expect(getRecommendedStatusActions([
+      { code: 'backend.dir', level: 'error', message: 'missing backend' },
+      { code: 'gitmodules.backend.path', level: 'warn', message: 'wrong backend path' },
+    ])).toEqual([])
+
+    expect(getRecommendedStatusActions([
+      { code: 'backend.dir', level: 'error', message: 'missing backend' },
+      { code: 'gitmodules.backend.url', level: 'warn', message: 'origin missing while child is absent' },
+    ])).toEqual(['init'])
 
     expect(getRecommendedStatusActions([
       { code: 'backend.workingTree', level: 'warn', message: 'dirty' },

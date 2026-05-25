@@ -32,6 +32,27 @@ describe('parseGitHubHttpsUrl', () => {
   test('rejects non-HTTPS GitHub URLs', () => {
     expect(parseGitHubHttpsUrl('http://github.com/acme/api.git')).toBeNull()
   })
+
+  test('rejects GitHub URLs with query strings or fragments', () => {
+    expect(parseGitHubHttpsUrl('https://github.com/acme/api.git?tab=readme')).toBeNull()
+    expect(parseGitHubHttpsUrl('https://github.com/acme/api.git#readme')).toBeNull()
+  })
+
+  test('rejects GitHub URLs with embedded credentials', () => {
+    expect(parseGitHubHttpsUrl('https://ghp_secret@github.com/acme/api.git')).toBeNull()
+    expect(parseGitHubHttpsUrl('https://octo:ghp_secret@github.com/acme/api.git')).toBeNull()
+  })
+
+  test('rejects GitHub URLs with invalid owner or repository segments', () => {
+    expect(parseGitHubHttpsUrl('https://github.com/-acme/api.git')).toBeNull()
+    expect(parseGitHubHttpsUrl('https://github.com/acme-/api.git')).toBeNull()
+    expect(parseGitHubHttpsUrl('https://github.com/acme/my%20api.git')).toBeNull()
+  })
+
+  test('returns null for malformed percent-encoded GitHub paths', () => {
+    expect(parseGitHubHttpsUrl('https://github.com/acme/%ZZ.git')).toBeNull()
+    expect(parseGitHubHttpsUrl('https://github.com/%ZZ/api.git')).toBeNull()
+  })
 })
 
 describe('createGitHubClient', () => {
@@ -53,6 +74,7 @@ describe('createGitHubClient', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/user', expect.objectContaining({
       baseURL: 'https://api.github.com',
+      timeout: 30000,
       headers: {
         Accept: 'application/vnd.github+json',
         Authorization: 'Bearer token',

@@ -3,16 +3,18 @@ import { rt } from './text.js'
 import {
   commitWithMessage,
   getPorcelainStatus,
+  hasSubmodulePointerChange,
   mergeRef,
   rebaseOnto,
   stagePaths,
+  unstagePaths,
 } from './git.js'
 import {
   handleConflict,
   type ConflictOperation,
 } from './sync-conflicts.js'
 import {
-  getMainRepositoryChangePlan,
+  buildMainRepositoryChangePlan,
   type OriginSyncAction,
   type UpstreamSyncAction,
 } from './sync.js'
@@ -65,10 +67,11 @@ export async function handleMainRepositoryPointerChanges(input: {
   const porcelainStatus = await getPorcelainStatus(input.projectDir)
   if (porcelainStatus === null || porcelainStatus.length === 0) return 'skipped'
 
-  const changePlan = getMainRepositoryChangePlan(
+  const changePlan = await buildMainRepositoryChangePlan({
     porcelainStatus,
-    ['.gitmodules', input.backendName, input.frontendName],
-  )
+    allowedPaths: [input.backendName, input.frontendName],
+    hasPointerChange: async (path) => hasSubmodulePointerChange(input.projectDir, path),
+  })
   if (changePlan.committablePaths.length === 0 && changePlan.unrelatedLines.length === 0) return 'skipped'
 
   if (changePlan.unrelatedLines.length > 0) {
@@ -88,7 +91,8 @@ export async function handleMainRepositoryPointerChanges(input: {
   if (!confirmed) return 'stopped'
 
   if (!(await stagePaths(input.projectDir, changePlan.committablePaths))) return 'failed'
-  return (await commitWithMessage(input.projectDir, 'chore: sync repository pointers'))
-    ? 'updated'
-    : 'failed'
+  if (await commitWithMessage(input.projectDir, 'chore: sync repository pointers')) return 'updated'
+
+  await unstagePaths(input.projectDir, changePlan.committablePaths)
+  return 'failed'
 }

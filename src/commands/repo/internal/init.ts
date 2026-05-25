@@ -1,8 +1,13 @@
 import { rt } from './text.js'
 import {
+  OFFICIAL_BACKEND_REPO,
+  OFFICIAL_FRONTEND_REPO,
+} from './constants.js'
+import {
   parseGitHubHttpsUrl,
   type GitHubRepoRef,
 } from './github.js'
+import { formatErrorMessage, redactUrlCredentials } from './display.js'
 
 export interface DefaultRemotePlanInput {
   owner: string
@@ -22,6 +27,31 @@ export function buildDefaultRemotePlan(input: DefaultRemotePlanInput): RemotePla
     main: `https://github.com/${input.owner}/${input.projectName}.git`,
     backend: `https://github.com/${input.owner}/${input.backendName}.git`,
     frontend: `https://github.com/${input.owner}/${input.frontendName}.git`,
+  }
+}
+
+export interface ExistingRemotePlanInput {
+  generated: RemotePlan
+  mainOrigin?: string | null
+  backendOrigin?: string | null
+  frontendOrigin?: string | null
+  gitmodulesBackendUrl?: string | null
+  gitmodulesFrontendUrl?: string | null
+}
+
+export function preferExistingRemotePlan(input: ExistingRemotePlanInput): RemotePlan {
+  return {
+    main: preferGitHubUrl(input.mainOrigin, input.generated.main),
+    backend: preferGitHubUrl(
+      preferNonOfficialChildUrl(input.backendOrigin)
+        ?? preferNonOfficialChildUrl(input.gitmodulesBackendUrl),
+      input.generated.backend,
+    ),
+    frontend: preferGitHubUrl(
+      preferNonOfficialChildUrl(input.frontendOrigin)
+        ?? preferNonOfficialChildUrl(input.gitmodulesFrontendUrl),
+      input.generated.frontend,
+    ),
   }
 }
 
@@ -49,18 +79,13 @@ export function upsertGitmodulesContent(
   input: GitmodulesInput,
 ): string {
   const targetNames = new Set([input.backendName, input.frontendName])
+  const targetPaths = targetNames
   const preservedLines: string[] = []
-  let skippingTargetSection = false
+  const sections = splitGitmodulesSections(currentContent)
 
-  for (const line of currentContent.split(/\r?\n/)) {
-    const section = line.match(/^\[submodule "(.+)"\]\s*$/)
-    if (section) {
-      skippingTargetSection = targetNames.has(section[1]!)
-    }
-
-    if (!skippingTargetSection) {
-      preservedLines.push(line)
-    }
+  for (const section of sections) {
+    if (shouldReplaceGitmoduleSection(section, targetNames, targetPaths)) continue
+    preservedLines.push(...section.lines)
   }
 
   while (preservedLines.length > 0 && preservedLines[preservedLines.length - 1]!.trim() === '') {
@@ -74,6 +99,50 @@ export function upsertGitmodulesContent(
     ...nextSection,
     '',
   ].join('\n')
+}
+
+interface GitmodulesSection {
+  name: string | null
+  lines: string[]
+}
+
+function splitGitmodulesSections(content: string): GitmodulesSection[] {
+  const sections: GitmodulesSection[] = []
+  let current: GitmodulesSection = { name: null, lines: [] }
+
+  for (const line of content.split(/\r?\n/)) {
+    const section = line.match(/^\[submodule "(.+)"\]\s*$/)
+    if (section) {
+      if (current.lines.length > 0) sections.push(current)
+      current = { name: section[1]!, lines: [line] }
+      continue
+    }
+
+    current.lines.push(line)
+  }
+
+  if (current.lines.length > 0) sections.push(current)
+  return sections
+}
+
+function shouldReplaceGitmoduleSection(
+  section: GitmodulesSection,
+  targetNames: Set<string>,
+  targetPaths: Set<string>,
+): boolean {
+  if (section.name && targetNames.has(section.name)) return true
+
+  const path = findGitmodulePathInSection(section)
+  return path !== null && targetPaths.has(path)
+}
+
+function findGitmodulePathInSection(section: GitmodulesSection): string | null {
+  for (const line of section.lines) {
+    const match = line.trim().match(/^path\s*=\s*(.+)$/)
+    if (match) return match[1]!.trim()
+  }
+
+  return null
 }
 
 export interface NormalizedRemotePlan {
@@ -90,6 +159,20 @@ export function normalizeRemotePlan(plan: RemotePlan): NormalizedRemotePlan {
   }
 }
 
+export function validateDistinctRemotePlan(plan: NormalizedRemotePlan): string | undefined {
+  const seen = new Map<string, keyof NormalizedRemotePlan>()
+  for (const role of ['main', 'backend', 'frontend'] as const) {
+    const ref = plan[role]
+    const key = `${ref.owner.toLowerCase()}/${ref.repo.toLowerCase()}`
+    const previous = seen.get(key)
+    if (previous) {
+      return `${previous} and ${role} GitHub repositories must be different`
+    }
+    seen.set(key, role)
+  }
+  return undefined
+}
+
 export type NormalizeRemotePlanResult =
   | { ok: true; plan: NormalizedRemotePlan }
   | { ok: false; error: string }
@@ -100,13 +183,27 @@ export function tryNormalizeRemotePlan(plan: RemotePlan): NormalizeRemotePlanRes
   } catch (error) {
     return {
       ok: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: formatErrorMessage(error),
     }
   }
 }
 
 export function isGitHubHttpsUrl(value: string): boolean {
   return Boolean(parseGitHubHttpsUrl(value))
+}
+
+function preferGitHubUrl(candidate: string | null | undefined, fallback: string): string {
+  return candidate && isGitHubHttpsUrl(candidate) ? candidate : fallback
+}
+
+function preferNonOfficialChildUrl(candidate: string | null | undefined): string | null {
+  if (!candidate || !isGitHubHttpsUrl(candidate)) return null
+  return isOfficialTemplateUrl(candidate) ? null : candidate
+}
+
+function isOfficialTemplateUrl(url: string): boolean {
+  const normalized = parseGitHubHttpsUrl(url)?.normalizedUrl
+  return normalized === OFFICIAL_BACKEND_REPO || normalized === OFFICIAL_FRONTEND_REPO
 }
 
 export function validateGitHubOwnerName(value: string): string | undefined {
@@ -129,13 +226,12 @@ export function formatGitHubRepoInitError(error: unknown): string {
   if (status === 403) return rt('repoInitGithubPermissionFailed')
   if (status === 422) return rt('repoInitGithubCreateFailed')
 
-  const message = error instanceof Error ? error.message : String(error)
-  return `${rt('repoInitGithubRequestFailed')}: ${message}`
+  return `${rt('repoInitGithubRequestFailed')}: ${formatErrorMessage(error)}`
 }
 
 function parseRequiredGitHubUrl(url: string): GitHubRepoRef {
   const ref = parseGitHubHttpsUrl(url)
-  if (!ref) throw new Error(`${rt('repoInitOnlyGithubHttps')}: ${url}`)
+  if (!ref) throw new Error(`${rt('repoInitOnlyGithubHttps')}: ${redactUrlCredentials(url) ?? url}`)
   return ref
 }
 

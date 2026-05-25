@@ -1,4 +1,5 @@
 import { rt } from './text.js'
+import { redactUrlCredentials } from './display.js'
 
 export type StatusLevel = 'ok' | 'warn' | 'error'
 
@@ -19,9 +20,11 @@ export interface RepositoryAssessmentInput {
   exists: boolean
   isGitRepo: boolean
   isGitRoot: boolean
+  isEmptyDirectory?: boolean
   isShallow: boolean
   originUrl: string | null
   upstreamUrl: string | null
+  currentBranch: string | null
   expectedUpstreamUrl?: string
   porcelainStatus: string[] | null
 }
@@ -40,23 +43,99 @@ export function getOverallStatus(checks: StatusCheck[]): StatusLevel {
 }
 
 export function getRecommendedStatusActions(checks: StatusCheck[]): RecommendedStatusAction[] {
-  if (getOverallStatus(checks) === 'error') return []
+  const repairableMissingChildren = getInitRepairableMissingChildren(checks)
+  const repairableMissingGitmodules = isMissingGitmodulesFileRepairable(checks)
+  const hasBlockingError = checks.some((check) => (
+    check.level === 'error' && !isRepoInitRepairableIssue(
+      check,
+      repairableMissingChildren,
+      repairableMissingGitmodules,
+    )
+  ))
+  if (hasBlockingError) return []
 
   const hasSetupIssue = checks.some((check) => (
-    check.level !== 'ok' &&
-    (
-      check.code.endsWith('.origin') ||
-      check.code.endsWith('.upstream') ||
-      check.code === 'backend.shallow' ||
-      check.code === 'frontend.shallow' ||
-      check.code.startsWith('gitmodules.')
-    )
+    isRepoInitRepairableIssue(check, repairableMissingChildren, repairableMissingGitmodules)
   ))
   if (hasSetupIssue) return ['init']
 
   if (getOverallStatus(checks) === 'ok') return ['sync', 'push']
 
   return []
+}
+
+function getInitRepairableMissingChildren(checks: StatusCheck[]): Set<'backend' | 'frontend'> {
+  const result = new Set<'backend' | 'frontend'>()
+  const mainReadyForSubmodules = !checks.some((check) => (
+    check.level !== 'ok' && (check.code === 'main.git' || check.code === 'main.root')
+  ))
+
+  for (const role of ['backend', 'frontend'] as const) {
+    const missingDir = checks.some((check) => (
+      check.code === `${role}.dir` && check.level !== 'ok'
+    ))
+    if (!missingDir) {
+      result.add(role)
+      continue
+    }
+
+    if (!mainReadyForSubmodules) continue
+
+    const hasBlockingGitmodulesIssue = checks.some((check) => (
+      check.level !== 'ok' && (
+        check.code === 'gitmodules.file' ||
+        check.code === `gitmodules.${role}.entry` ||
+        check.code === `gitmodules.${role}.path`
+      )
+    ))
+    if (!hasBlockingGitmodulesIssue) result.add(role)
+  }
+
+  return result
+}
+
+function isMissingGitmodulesFileRepairable(checks: StatusCheck[]): boolean {
+  const missingGitmodules = checks.some((check) => (
+    check.code === 'gitmodules.file' && check.level !== 'ok'
+  ))
+  if (!missingGitmodules) return false
+
+  return [
+    'main.git',
+    'main.root',
+    'backend.git',
+    'backend.root',
+    'frontend.git',
+    'frontend.root',
+  ].every((code) => checks.some((check) => check.code === code && check.level === 'ok'))
+}
+
+function isRepoInitRepairableIssue(
+  check: StatusCheck,
+  repairableMissingChildren: Set<'backend' | 'frontend'>,
+  repairableMissingGitmodules: boolean,
+): boolean {
+  if (check.level === 'ok') return false
+  if (check.code === 'gitmodules.file') return repairableMissingGitmodules
+  if (check.code === 'main.upstream') return false
+  if (check.code === 'backend.dir') return repairableMissingChildren.has('backend')
+  if (check.code === 'frontend.dir') return repairableMissingChildren.has('frontend')
+
+  return (
+    check.code.endsWith('.origin') ||
+    check.code.endsWith('.upstream') ||
+    check.code === 'main.git' ||
+    check.code === 'main.root' ||
+    check.code === 'backend.git' ||
+    check.code === 'backend.root' ||
+    check.code === 'backend.branch' ||
+    check.code === 'backend.shallow' ||
+    check.code === 'frontend.git' ||
+    check.code === 'frontend.root' ||
+    check.code === 'frontend.branch' ||
+    check.code === 'frontend.shallow' ||
+    (check.code.startsWith('gitmodules.') && check.code !== 'gitmodules.file')
+  )
 }
 
 export function parseGitmodules(content: string): GitmodulesMap {
@@ -106,6 +185,18 @@ export function assessRepository(input: RepositoryAssessmentInput): StatusCheck[
       : rt('repoStatusGitError', { label: input.label }),
   })
 
+  if (
+    input.role !== 'main' &&
+    !input.isGitRoot &&
+    input.isEmptyDirectory === false
+  ) {
+    checks.push({
+      code: `${prefix}.dirContent`,
+      level: 'error',
+      message: rt('repoStatusChildDirContentError', { label: input.label }),
+    })
+  }
+
   if (!input.isGitRepo) return checks
 
   checks.push({
@@ -130,7 +221,15 @@ export function assessRepository(input: RepositoryAssessmentInput): StatusCheck[
     message: input.originUrl
       ? rt('repoStatusOriginOk', { label: input.label })
       : rt('repoStatusOriginWarn', { label: input.label }),
-    detail: input.originUrl ?? undefined,
+    detail: redactUrlCredentials(input.originUrl),
+  })
+
+  checks.push({
+    code: `${prefix}.branch`,
+    level: input.currentBranch ? 'ok' : 'warn',
+    message: input.currentBranch
+      ? rt('repoStatusBranchOk', { label: input.label, branch: input.currentBranch })
+      : rt('repoStatusBranchWarn', { label: input.label }),
   })
 
   if (input.expectedUpstreamUrl !== undefined) {
@@ -146,9 +245,9 @@ export function assessRepository(input: RepositoryAssessmentInput): StatusCheck[
   } else if (input.upstreamUrl) {
     checks.push({
       code: `${prefix}.upstream`,
-      level: 'ok',
+      level: input.role === 'main' ? 'warn' : 'ok',
       message: rt('repoStatusUpstreamExists', { label: input.label }),
-      detail: input.upstreamUrl,
+      detail: redactUrlCredentials(input.upstreamUrl),
     })
   }
 
@@ -256,7 +355,7 @@ function getGitmoduleRoleLabel(role: 'backend' | 'frontend'): string {
 
 function formatExpectedActual(expected: string, actual: string | undefined | null): string {
   return rt('repoStatusExpectedActual', {
-    expected,
-    actual: actual ?? rt('repoStatusMissing'),
+    expected: redactUrlCredentials(expected) ?? expected,
+    actual: redactUrlCredentials(actual) ?? rt('repoStatusMissing'),
   })
 }

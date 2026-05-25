@@ -19,6 +19,7 @@ import {
   checkChildRepositoryRoots,
   checkGitAvailable,
   createLocalInitCommit,
+  initMissingChildRepositories,
 } from './init-operations.js'
 import { rt } from './text.js'
 import {
@@ -26,8 +27,10 @@ import {
   formatGitHubRepoInitError,
   isGitHubHttpsUrl,
   normalizeRemotePlan,
+  preferExistingRemotePlan,
   resolvePromptTextValue,
   tryNormalizeRemotePlan,
+  validateDistinctRemotePlan,
   validateGitHubOwnerName,
   type NormalizedRemotePlan,
   type RemotePlan,
@@ -37,6 +40,19 @@ import {
   type RepoPlanItem,
   type RepoRole,
 } from './init-types.js'
+import {
+  createRepoInitSnapshot,
+  restoreRepoInitSnapshot,
+} from './transaction.js'
+import {
+  getCurrentBranch,
+  getRemoteUrl,
+  isGitRepoRoot,
+} from './git.js'
+import { readOptionalTextFile } from './files.js'
+import { installRepoInitRollbackSignalHandlers } from './signals.js'
+import { parseGitmodules } from './status.js'
+import { formatErrorMessage } from './display.js'
 
 export interface RepoInitActionOptions {
   project?: string
@@ -104,6 +120,54 @@ function renderPlanNote(plan: RepoPlan, config: StrictProjectConfig): string {
   ].join('\n')
 }
 
+function getGitmoduleUrl(content: string | null, expectedPath: string): string | null {
+  if (!content) return null
+  const entries = parseGitmodules(content)
+  const entry = entries[expectedPath] ?? Object.values(entries).find((item) => item.path === expectedPath)
+  return entry?.url ?? null
+}
+
+async function needsChildSubmoduleInit(dir: string): Promise<boolean> {
+  return !existsSync(dir) || !(await isGitRepoRoot(dir))
+}
+
+async function buildInitialRemoteDefaults(input: {
+  projectDir: string
+  backendDir: string
+  frontendDir: string
+  owner: string
+  config: StrictProjectConfig
+}): Promise<RemotePlan> {
+  const generated = buildDefaultRemotePlan({
+    owner: input.owner,
+    projectName: input.config.name,
+    backendName: input.config.backend_name,
+    frontendName: input.config.frontend_name,
+  })
+  const gitmodulesPath = join(input.projectDir, '.gitmodules')
+  const gitmodulesContent = readOptionalTextFile(gitmodulesPath)
+
+  const [mainIsRoot, backendIsRoot, frontendIsRoot] = await Promise.all([
+    isGitRepoRoot(input.projectDir),
+    isGitRepoRoot(input.backendDir),
+    isGitRepoRoot(input.frontendDir),
+  ])
+  const [mainOrigin, backendOrigin, frontendOrigin] = await Promise.all([
+    mainIsRoot ? getRemoteUrl(input.projectDir, 'origin') : null,
+    backendIsRoot ? getRemoteUrl(input.backendDir, 'origin') : null,
+    frontendIsRoot ? getRemoteUrl(input.frontendDir, 'origin') : null,
+  ])
+
+  return preferExistingRemotePlan({
+    generated,
+    mainOrigin,
+    backendOrigin,
+    frontendOrigin,
+    gitmodulesBackendUrl: getGitmoduleUrl(gitmodulesContent, input.config.backend_name),
+    gitmodulesFrontendUrl: getGitmoduleUrl(gitmodulesContent, input.config.frontend_name),
+  })
+}
+
 async function promptRemoteUrl(role: RepoRole, defaultValue: string): Promise<string | null> {
   const value = await clack.text({
     message: `${getRoleLabel(role)} ${rt('repoInitRemoteUrl')}`,
@@ -137,24 +201,36 @@ async function promptRemotePlan(defaults: RemotePlan): Promise<NormalizedRemoteP
 
   if (useDefaults) {
     const normalized = tryNormalizeRemotePlan(defaults)
-    if (normalized.ok) return normalized.plan
-    clack.log.warn(chalk.yellow(normalized.error))
+    if (normalized.ok) {
+      const distinctError = validateDistinctRemotePlan(normalized.plan)
+      if (!distinctError) return normalized.plan
+      clack.log.warn(chalk.yellow(distinctError))
+    } else {
+      clack.log.warn(chalk.yellow(normalized.error))
+    }
   }
 
-  const main = await promptRemoteUrl('main', defaults.main)
-  if (!main) return null
-  const backend = await promptRemoteUrl('backend', defaults.backend)
-  if (!backend) return null
-  const frontend = await promptRemoteUrl('frontend', defaults.frontend)
-  if (!frontend) return null
+  for (;;) {
+    const main = await promptRemoteUrl('main', defaults.main)
+    if (!main) return null
+    const backend = await promptRemoteUrl('backend', defaults.backend)
+    if (!backend) return null
+    const frontend = await promptRemoteUrl('frontend', defaults.frontend)
+    if (!frontend) return null
 
-  return normalizeRemotePlan({ main, backend, frontend })
+    const normalized = normalizeRemotePlan({ main, backend, frontend })
+    const distinctError = validateDistinctRemotePlan(normalized)
+    if (!distinctError) return normalized
+
+    clack.log.error(chalk.red(distinctError))
+  }
 }
 
 async function planRemoteState(
   github: ReturnType<typeof createGitHubClient>,
   role: RepoRole,
   ref: GitHubRepoRef,
+  options: { blockedCreatePath?: string } = {},
 ): Promise<RepoPlanItem | null> {
   let repository: Awaited<ReturnType<typeof github.getRepository>>
   try {
@@ -177,6 +253,13 @@ async function planRemoteState(
       return null
     }
     return { role, ref, action: 'reuse', private: Boolean(repository.private) }
+  }
+
+  if (options.blockedCreatePath) {
+    clack.log.error(chalk.red(rt('repoInitMissingChildrenNewRepoUnsupported', {
+      paths: options.blockedCreatePath,
+    })))
+    return null
   }
 
   const createMissing = await clack.confirm({
@@ -217,12 +300,17 @@ async function planRemoteState(
 async function buildRepoPlan(
   github: ReturnType<typeof createGitHubClient>,
   remotes: NormalizedRemotePlan,
+  blockedChildCreates: Partial<Record<'backend' | 'frontend', string>> = {},
 ): Promise<RepoPlan | null> {
   const main = await planRemoteState(github, 'main', remotes.main)
   if (!main) return null
-  const backend = await planRemoteState(github, 'backend', remotes.backend)
+  const backend = await planRemoteState(github, 'backend', remotes.backend, {
+    blockedCreatePath: blockedChildCreates.backend,
+  })
   if (!backend) return null
-  const frontend = await planRemoteState(github, 'frontend', remotes.frontend)
+  const frontend = await planRemoteState(github, 'frontend', remotes.frontend, {
+    blockedCreatePath: blockedChildCreates.frontend,
+  })
   if (!frontend) return null
 
   return { main, backend, frontend }
@@ -232,6 +320,11 @@ async function maybeCreateLocalCommit(
   projectDir: string,
   config: StrictProjectConfig,
 ): Promise<void> {
+  if (!(await getCurrentBranch(projectDir))) {
+    clack.log.warn(chalk.yellow(rt('repoInitMainDetachedCommitSkipped')))
+    return
+  }
+
   const createCommit = await clack.confirm({
     message: rt('repoInitCommitQuestion'),
     initialValue: false,
@@ -243,6 +336,19 @@ async function maybeCreateLocalCommit(
   const committed = await createLocalInitCommit(projectDir, config)
   if (!committed) {
     clack.log.warn(chalk.yellow(rt('repoInitCommitFailedHint')))
+  }
+}
+
+async function restoreSnapshotForInit(
+  snapshot: Awaited<ReturnType<typeof createRepoInitSnapshot>>,
+): Promise<boolean> {
+  try {
+    await restoreRepoInitSnapshot(snapshot)
+    return true
+  } catch (error) {
+    clack.log.warn(chalk.yellow(rt('repoInitRollbackFailed')))
+    clack.log.warn(chalk.yellow(formatErrorMessage(error)))
+    return false
   }
 }
 
@@ -258,7 +364,7 @@ export async function repoInitAction(options: RepoInitActionOptions = {}): Promi
   try {
     config = readStrictProjectConfig(projectDir)
   } catch (error) {
-    clack.log.error(chalk.red(error instanceof Error ? error.message : String(error)))
+    clack.log.error(chalk.red(formatErrorMessage(error)))
     return false
   }
 
@@ -281,20 +387,32 @@ export async function repoInitAction(options: RepoInitActionOptions = {}): Promi
     return false
   }
 
-  if (!existsSync(backendDir)) {
-    clack.log.error(chalk.red(`${rt('backendDirNotFound')}: ${backendDir}`))
-    return false
-  }
-  if (!existsSync(frontendDir)) {
-    clack.log.error(chalk.red(`${rt('frontendDirNotFound')}: ${frontendDir}`))
-    return false
-  }
   if (!(await checkGitAvailable())) {
     clack.log.error(chalk.red(rt('repoInitGitMissing')))
     return false
   }
-  if (!(await checkChildRepositoryRoots({ backendDir, frontendDir }))) {
-    clack.log.info(rt('repoInitChildGitRootHint'))
+  let snapshot: Awaited<ReturnType<typeof createRepoInitSnapshot>>
+  try {
+    snapshot = await createRepoInitSnapshot({ projectDir, backendDir, frontendDir })
+  } catch (error) {
+    clack.log.error(chalk.red(formatErrorMessage(error)))
+    clack.log.info(rt('repoInitRetryHint'))
+    return false
+  }
+  const disposeRollbackSignalHandlers = installRepoInitRollbackSignalHandlers({
+    snapshot,
+    warn: (message) => clack.log.warn(chalk.yellow(message)),
+    rollbackFailedMessage: rt('repoInitRollbackFailed'),
+  })
+  const rollbackAndCancel = async (message = rt('repoInitCancelled')): Promise<false> => {
+    await restoreSnapshotForInit(snapshot)
+    disposeRollbackSignalHandlers()
+    cancelRepoInit(message)
+    return false
+  }
+  const rollbackAndFail = async (): Promise<false> => {
+    await restoreSnapshotForInit(snapshot)
+    disposeRollbackSignalHandlers()
     return false
   }
 
@@ -308,18 +426,17 @@ export async function repoInitAction(options: RepoInitActionOptions = {}): Promi
     validate: (value) => value?.trim() ? undefined : rt('repoInitTokenRequired'),
   })
   if (isCancelled(tokenFromPrompt)) {
-    cancelRepoInit()
-    return false
+    return rollbackAndCancel()
   }
 
-  const token = discoveredToken?.token || String(tokenFromPrompt)
+  const token = discoveredToken?.token || String(tokenFromPrompt).trim()
   const github = createGitHubClient(token)
   let user: Awaited<ReturnType<typeof github.getAuthenticatedUser>>
   try {
     user = await github.getAuthenticatedUser()
   } catch (error) {
     clack.log.error(chalk.red(formatGitHubRepoInitError(error)))
-    return false
+    return rollbackAndFail()
   }
 
   const owner = await clack.text({
@@ -329,39 +446,79 @@ export async function repoInitAction(options: RepoInitActionOptions = {}): Promi
     validate: (value) => validateGitHubOwnerName(resolvePromptTextValue(value, user.login)),
   })
   if (isCancelled(owner)) {
-    cancelRepoInit()
-    return false
+    return rollbackAndCancel()
   }
 
-  const defaults = buildDefaultRemotePlan({
+  const defaults = await buildInitialRemoteDefaults({
+    projectDir,
+    backendDir,
+    frontendDir,
     owner: resolvePromptTextValue(String(owner), user.login),
-    projectName: config.name,
-    backendName: config.backend_name,
-    frontendName: config.frontend_name,
+    config,
   })
 
   const remotePlan = await promptRemotePlan(defaults)
-  if (!remotePlan) return false
+  if (!remotePlan) return rollbackAndFail()
 
+  const [backendNeedsSubmoduleInit, frontendNeedsSubmoduleInit] = await Promise.all([
+    needsChildSubmoduleInit(backendDir),
+    needsChildSubmoduleInit(frontendDir),
+  ])
   let repoPlan: RepoPlan | null
   try {
-    repoPlan = await buildRepoPlan(github, remotePlan)
+    repoPlan = await buildRepoPlan(github, remotePlan, {
+      backend: backendNeedsSubmoduleInit ? config.backend_name : undefined,
+      frontend: frontendNeedsSubmoduleInit ? config.frontend_name : undefined,
+    })
   } catch {
-    return false
+    return rollbackAndFail()
   }
-  if (!repoPlan) return false
+  if (!repoPlan) return rollbackAndFail()
 
   const confirmedApply = await clack.confirm({
     message: renderPlanNote(repoPlan, config),
     initialValue: true,
   })
   if (isCancelled(confirmedApply)) {
-    cancelRepoInit()
-    return false
+    return rollbackAndCancel()
   }
   if (!confirmedApply) {
-    cancelRepoInit()
-    return false
+    return rollbackAndCancel()
+  }
+
+  const childInitResult = await initMissingChildRepositories({
+    projectDir,
+    config,
+    backendDir,
+    frontendDir,
+    gitmodules: {
+      backendName: config.backend_name,
+      backendUrl: repoPlan.backend.ref.normalizedUrl,
+      frontendName: config.frontend_name,
+      frontendUrl: repoPlan.frontend.ref.normalizedUrl,
+    },
+    authToken: token,
+  })
+  if (childInitResult !== 'ok') {
+    if (childInitResult === 'failed') {
+      await restoreSnapshotForInit(snapshot)
+      disposeRollbackSignalHandlers()
+      clack.log.info(rt('repoInitRetryHint'))
+      return false
+    }
+    return rollbackAndCancel()
+  }
+  if (!existsSync(backendDir)) {
+    clack.log.error(chalk.red(`${rt('backendDirNotFound')}: ${backendDir}`))
+    return rollbackAndFail()
+  }
+  if (!existsSync(frontendDir)) {
+    clack.log.error(chalk.red(`${rt('frontendDirNotFound')}: ${frontendDir}`))
+    return rollbackAndFail()
+  }
+  if (!(await checkChildRepositoryRoots({ backendDir, frontendDir }))) {
+    clack.log.info(rt('repoInitChildGitRootHint'))
+    return rollbackAndFail()
   }
 
   try {
@@ -373,10 +530,14 @@ export async function repoInitAction(options: RepoInitActionOptions = {}): Promi
       github,
       userLogin: user.login,
       plan: repoPlan,
+      snapshot,
+      authToken: token,
     })
   } catch {
+    disposeRollbackSignalHandlers()
     return false
   }
+  disposeRollbackSignalHandlers()
 
   await maybeCreateLocalCommit(projectDir, config)
 

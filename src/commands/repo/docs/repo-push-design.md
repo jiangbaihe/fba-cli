@@ -1,204 +1,42 @@
-# 实验性仓库推送设计
+# repo push 设计摘要
 
 ## 目标
 
-`fba-cli repo push` 是实验性仓库维护流程中的发布步骤。
+`fba-cli repo push` 是唯一允许推送的 repo 子命令。它只发布用户已经整理好的提交，不自动 pull、merge、rebase、业务 commit、tag push 或 force push。
 
-它负责推送已经准备好的本地提交：
+## 关键规则
 
-- 后端仓库
-- 前端仓库
-- 主仓库
-
-该命令只发布干净的本地历史。它不会修复本地状态、创建提交、merge、rebase、pull 或 force push。
-
-## 边界
-
-`repo push` 是唯一允许执行 `git push` 的 repo 子命令。
-
-实现收在 repo 模块内：
-
-```text
-src/commands/repo/push.ts
-src/commands/repo/internal/push-runtime.ts
-src/commands/repo/internal/push-inspection.ts
-src/commands/repo/internal/push.ts
-src/commands/repo/internal/git.ts
-```
-
-顶层命令文件只做薄入口。检查、规划、dry-run 执行、真实 push 执行和摘要逻辑都放在 `src/commands/repo/internal/`。
-
-## 项目解析
-
-命令沿用 fba-cli 现有项目解析规则：
-
-1. 显式全局参数 `-p, --project <dir>`
-2. 从当前工作目录向上查找最近的 `.fba.json`
-3. 全局配置 `~/.fba.json` 中的当前项目
-
-目标项目必须包含真实的 `.fba.json`，并包含：
-
-- `name`
-- `backend_name`
-- `frontend_name`
-
-在本地检查或 dry-run push 前，向导会展示解析出的项目，并要求用户确认。
-
-## 推送顺序
-
-推送顺序为：
-
-1. backend
-2. frontend
-3. main
-
-主仓最后推送，因为主仓子模块 gitlink 可能指向后端/前端提交。子仓提交应先存在于远程，主仓再发布指向它们的指针。
-
-## 前置条件
-
-每个仓库都必须满足：
-
-- 目录存在
-- 目录是 Git 仓库根目录
-- 工作区干净
-- 当前分支不是 detached HEAD
-- 已配置 `origin` remote
-
-后端和前端还应满足：
-
-- 仓库不是浅克隆
-- `upstream` 应指向官方 FBA 仓库
-- upstream 不一致是警告，不是硬阻断
-
-主仓还应满足：
-
-- `.gitmodules` 存在
-- 后端/前端 `.gitmodules` URL 与子仓 `origin` URL 一致
-- 子模块指针变化已经提交
-
-`repo push` 不会自动 stage 或 commit 子模块指针变化。
-
-## dry-run
-
-任何真实 push 前，命令会对每个仓库执行 dry-run：
+- 必须先确认目标项目，再做 dry-run 或真实 push。
+- 子仓目录名来自 `.fba.json`，必须是简单目录名；push 不处理需要 Git quoted path 解析的目录名。
+- 用户选择本次推送目标；可只推主仓、只推子仓或任意组合。
+- 发现运行期 GitHub token 时，GitHub HTTPS fetch、dry-run push 和 push 使用临时 Git extraheader；不写入 remote URL、本地配置、日志或错误输出。
+- 只有可识别的 Git 根目录、有当前分支、有 `origin` 的仓库会出现在可选目标中。
+- 只对选中仓库执行硬性前置检查；选中仓库必须不是浅克隆，包含选中的主仓；未选仓库的脏工作区、浅克隆、detached 状态不阻断。
+- 推送顺序固定：`backend`、`frontend`、`main`。
+- 真实 push 前先对选中仓库执行：
 
 ```bash
-git push --dry-run origin HEAD:<branch>
+git push --dry-run --no-follow-tags origin HEAD:<branch>
 ```
 
-如果任一 dry-run 失败，不会执行真实 push。
-
-dry-run 可以降低部分推送风险，但无法完全消除远程竞争。因此真实 push 阶段仍然会在第一个失败处立即停止。
-
-## 最终确认
-
-本地检查和所有 dry-run 都通过后，向导会展示：
-
-- 项目名称和路径
-- 仓库角色
-- 每个仓库的分支
-- 每个仓库的 `origin` URL
-- 推送顺序
-- 不会执行 merge、pull、commit、tag push 或 force push 的提示
-
-只有用户明确确认后，才进入真实 push 阶段。确认默认值应保持保守。
-
-## 应用阶段
-
-按推送顺序对每个仓库执行：
+- dry-run 全部通过后，仍需二次确认；真实 push 使用 `git push --no-follow-tags -u origin HEAD:<branch>`，在第一个失败处停止，且不受用户全局 `push.followTags` 配置影响。
+- 主仓只有真实子仓 gitlink 指针变化时，可询问是否创建本地主仓提交：
 
 ```bash
-git push -u origin HEAD:<branch>
+git add <backend_name> <frontend_name>
+git commit -m "chore: update submodule refs"
 ```
 
-`-u` 会为首次推送设置 upstream tracking；如果 tracking 已存在，也不会造成问题。
+- 判断真实指针变化必须使用 `git diff --quiet --ignore-submodules=dirty -- <child_path>`；dirty-only 子仓工作区不能触发主仓指针提交。
+- 如果当前工作区指针提交会指向后端/前端新提交，本次推送必须同时选择对应子仓；若未选择对应子仓，但该子仓当前 `HEAD` 已经在刷新后的 `origin` 上，可以创建主仓指针提交；否则自动跳过指针提交，继续推送已有主仓提交。
+- 推送主仓已有提交时，必须先刷新主仓 `origin`，再检查 `origin/<branch>..HEAD` 中所有待推主仓提交的子仓 gitlink。未选子仓会先 `git fetch origin --prune`；未选子仓的每个 gitlink 提交必须已在刷新后的 `origin` 上；已选子仓的当前 `HEAD` 必须包含每个 gitlink 提交；无法确认时阻断。
+- 用户拒绝指针提交，或本次未选择受影响子仓导致自动跳过指针提交后，可以继续推送主仓已有提交。
+- 主仓存在普通未提交改动时阻断，不得混入自动指针提交。
 
-不会推送 tag。
+## 验收重点
 
-## 失败行为
-
-`repo push` 没有远程回滚能力。
-
-如果 dry-run 失败：
-
-- 不推送任何仓库
-- 展示失败仓库
-- 提示用户修复本地或远程状态后重新运行
-
-如果真实 push 失败：
-
-- 立即停止后续处理
-- 展示已经推送的仓库
-- 展示尚未推送的仓库
-- 提示用户修复问题后重新运行
-
-## 完成输出
-
-成功后展示每个已推送仓库，并建议检查本地状态：
-
-```bash
-fba-cli repo status
-```
-
-## 发布打包
-
-当前 fork 使用 GitHub Release 包安装：
-
-```powershell
-npm install -g https://github.com/jiangbaihe/fba-cli/releases/latest/download/fba-cli.tgz
-```
-
-Release 资产固定命名为 `fba-cli.tgz`，用户不需要记具体版本号。源码仓库不提交 `dist/` 或 `.tgz`，发布包中必须包含已经构建好的 `dist/index.js`。
-
-发布由 tag 触发 GitHub Actions：
-
-```powershell
-git tag repo-v0.1.10
-git push origin repo-v0.1.10
-```
-
-不要为实验性版本推送 `v*` tag。`v*` tag 属于原项目 `.github/workflows/release.yml` 的 npm 发布流程，在 fork 中可能触发一个没有 `NPM_TOKEN` 或 npm 发布权限的失败 workflow。
-
-Actions 会自动执行：
-
-- `bun test --isolate`
-- `pnpm run typecheck`
-- `git diff --check`
-- `pnpm run build`
-- `npm pack`
-- 上传固定资产 `fba-cli.tgz`
-
-完整流程见 `repo-release-design.md`。
-
-发布后验证：
-
-```powershell
-npm install -g https://github.com/jiangbaihe/fba-cli/releases/latest/download/fba-cli.tgz
-fba-cli repo --help
-```
-
-## 测试
-
-测试不得使用真实远程 push。
-
-覆盖重点：
-
-- dry-run 前必须先确认项目
-- 最终确认前不会真实 push
-- 推送顺序为 backend、frontend、main
-- 脏工作区阻止 push
-- 缺少 `origin` 阻止 push
-- detached HEAD 阻止 push
-- 浅克隆子仓阻止 push
-- `.gitmodules` 问题阻止 push
-- upstream 不一致只作为警告
-- dry-run 失败会阻止所有真实 push
-- 真实 push 在第一个失败处停止
-
-验证命令：
-
-```bash
-bun test
-bunx tsc --noEmit
-git diff --check
-```
+- dirty-only 子仓工作区不触发主仓指针提交。
+- 创建主仓指针提交时，未选子仓必须确认当前 `HEAD` 已在 `origin` 上；否则不提示创建，直接跳过自动指针提交。
+- 主仓待推历史不能引用未推送、未包含在已选子仓 `HEAD` 中或无法确认的子仓提交；主仓 `origin` 或未选子仓 `origin` 刷新失败时按无法确认处理。
+- dry-run 失败不会真实 push。
+- 真实 push 失败后展示已推送、失败、未推送仓库。

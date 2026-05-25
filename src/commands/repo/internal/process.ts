@@ -1,6 +1,7 @@
 import { execa } from 'execa'
 import * as clack from '@clack/prompts'
 import chalk from 'chalk'
+import { redactSensitiveText } from './display.js'
 
 export interface RepoRunOptions {
   cwd?: string
@@ -17,6 +18,10 @@ function getErrorTail(output: string, maxLines = 8): string {
   const lines = output.trim().split('\n')
   if (lines.length <= maxLines) return output.trim()
   return `  ...\n${lines.slice(-maxLines).join('\n')}`
+}
+
+function formatCommand(cmd: string, args: string[]): string {
+  return redactSensitiveText(`${cmd} ${args.join(' ')}`.trim())
 }
 
 export async function run(
@@ -44,10 +49,10 @@ export async function run(
       if (opts.showErrorOutput !== false) {
         const output = (result.stderr ?? '').trim() || (result.stdout ?? '').trim()
         if (output) {
-          console.error(chalk.dim(`  Command: ${cmd} ${args.join(' ')}`))
+          console.error(chalk.dim(`  Command: ${formatCommand(cmd, args)}`))
           if (opts.cwd) console.error(chalk.dim(`  CWD: ${opts.cwd}`))
           console.error(chalk.dim(`  Exit code: ${result.exitCode}`))
-          console.error(chalk.red(getErrorTail(output)))
+          console.error(chalk.red(redactSensitiveText(getErrorTail(output))))
         }
       }
 
@@ -68,8 +73,8 @@ export async function run(
     spinner?.stop(chalk.red(`${label} ✗`))
 
     if (opts.showErrorOutput !== false) {
-      console.error(chalk.dim(`  Command: ${cmd} ${args.join(' ')}`))
-      console.error(chalk.red(`  ${error.message ?? String(error)}`))
+      console.error(chalk.dim(`  Command: ${formatCommand(cmd, args)}`))
+      console.error(chalk.red(`  ${redactSensitiveText(error.message ?? String(error))}`))
     }
 
     return {

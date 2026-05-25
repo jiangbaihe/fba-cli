@@ -1,10 +1,11 @@
-import { existsSync, readFileSync } from 'fs'
+import { existsSync } from 'fs'
 import { join } from 'path'
 import { rt } from './text.js'
 import {
   OFFICIAL_BACKEND_REPO,
   OFFICIAL_FRONTEND_REPO,
 } from './constants.js'
+import { readOptionalTextFile } from './files.js'
 import {
   getCurrentBranch,
   getPorcelainStatus,
@@ -16,6 +17,8 @@ import { readStrictProjectConfig } from './project.js'
 import {
   buildPushPlan,
   convertGitmodulesChecksToPushIssues,
+  getSelectablePushItemsFromProbes,
+  type BuildPushPlanOptions,
   type PushRepoRole,
   type PushRepositoryProbe,
 } from './push.js'
@@ -23,6 +26,9 @@ import { assessGitmodules } from './status.js'
 
 export interface ProjectPushPlan {
   config: ReturnType<typeof readStrictProjectConfig>
+  probes: Record<PushRepoRole, PushRepositoryProbe>
+  options: BuildPushPlanOptions
+  selectableItems: ReturnType<typeof getSelectablePushItemsFromProbes>
   result: ReturnType<typeof buildPushPlan>
 }
 
@@ -55,8 +61,24 @@ async function inspectPushRepository(input: {
     }
   }
 
-  const [gitRoot, shallow, originUrl, upstreamUrl, porcelainStatus, currentBranch] = await Promise.all([
-    isGitRepoRoot(input.dir),
+  const gitRoot = await isGitRepoRoot(input.dir)
+  if (!gitRoot) {
+    return {
+      role: input.role,
+      label: input.label,
+      dir: input.dir,
+      exists,
+      isGitRoot: false,
+      isShallow: false,
+      originUrl: null,
+      upstreamUrl: null,
+      expectedUpstreamUrl: input.expectedUpstreamUrl,
+      porcelainStatus: null,
+      currentBranch: null,
+    }
+  }
+
+  const [shallow, originUrl, upstreamUrl, porcelainStatus, currentBranch] = await Promise.all([
     isShallowRepo(input.dir),
     getRemoteUrl(input.dir, 'origin'),
     getRemoteUrl(input.dir, 'upstream'),
@@ -105,18 +127,24 @@ export async function buildProjectPushPlan(projectDir: string): Promise<ProjectP
   ])
   const gitmodulesPath = join(projectDir, '.gitmodules')
   const gitmodulesChecks = assessGitmodules({
-    content: existsSync(gitmodulesPath) ? readFileSync(gitmodulesPath, 'utf-8') : null,
+    content: readOptionalTextFile(gitmodulesPath),
     backendName: config.backend_name,
     backendOrigin: backend.originUrl,
     frontendName: config.frontend_name,
     frontendOrigin: frontend.originUrl,
   })
 
+  const probes = { main, backend, frontend }
+  const options = {
+    gitmodulesErrors: convertGitmodulesChecksToPushIssues(gitmodulesChecks),
+    mainAllowedDirtyPaths: [config.backend_name, config.frontend_name],
+  }
+
   return {
     config,
-    result: buildPushPlan(
-      { main, backend, frontend },
-      { gitmodulesErrors: convertGitmodulesChecksToPushIssues(gitmodulesChecks) },
-    ),
+    probes,
+    options,
+    selectableItems: getSelectablePushItemsFromProbes(probes),
+    result: buildPushPlan(probes, options),
   }
 }

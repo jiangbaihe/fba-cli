@@ -22,8 +22,23 @@ export function mapConflictChoiceToGitSide(
   return choice === 'local' ? 'theirs' : 'ours'
 }
 
-export function shouldStopAfterConflict(choice: ConflictChoice): boolean {
-  return choice === 'manual' || choice === 'abort'
+function getManualRecoveryCommands(dir: string, operation: ConflictOperation): string[] {
+  return [
+    `git -C ${dir} status`,
+    operation === 'rebase'
+      ? `git -C ${dir} rebase --continue`
+      : `git -C ${dir} commit --no-edit`,
+    operation === 'rebase'
+      ? `git -C ${dir} rebase --abort`
+      : `git -C ${dir} merge --abort`,
+  ]
+}
+
+function printManualRecoveryCommands(dir: string, operation: ConflictOperation): void {
+  clack.note(
+    getManualRecoveryCommands(dir, operation).join('\n'),
+    rt('repoSyncManualHint'),
+  )
 }
 
 export async function handleConflict(input: {
@@ -47,19 +62,14 @@ export async function handleConflict(input: {
     })),
     initialValue: 'manual',
   })
-  if (input.isCancelled(choice)) return 'cancelled'
+  if (input.isCancelled(choice)) {
+    printManualRecoveryCommands(input.dir, input.operation)
+    return 'stopped'
+  }
   const conflictChoice = choice as ConflictChoice
 
   if (conflictChoice === 'manual') {
-    clack.note(
-      [
-        `git -C ${input.dir} status`,
-        input.operation === 'rebase'
-          ? `git -C ${input.dir} rebase --continue`
-          : `git -C ${input.dir} commit --no-edit`,
-      ].join('\n'),
-      rt('repoSyncManualHint'),
-    )
+    printManualRecoveryCommands(input.dir, input.operation)
     return 'stopped'
   }
 
@@ -73,13 +83,22 @@ export async function handleConflict(input: {
   if (conflicts.length === 0) return 'failed'
 
   const side = mapConflictChoiceToGitSide(input.operation, conflictChoice)
-  if (!(await checkoutConflictSide(input.dir, side, conflicts))) return 'failed'
-  if (!(await stagePaths(input.dir, conflicts))) return 'failed'
+  if (!(await checkoutConflictSide(input.dir, side, conflicts))) {
+    printManualRecoveryCommands(input.dir, input.operation)
+    return 'stopped'
+  }
+  if (!(await stagePaths(input.dir, conflicts))) {
+    printManualRecoveryCommands(input.dir, input.operation)
+    return 'stopped'
+  }
 
   const completed = input.operation === 'rebase'
     ? await continueRebase(input.dir)
     : await commitNoEdit(input.dir)
-  return completed ? 'updated' : 'failed'
+  if (completed) return 'updated'
+
+  printManualRecoveryCommands(input.dir, input.operation)
+  return 'stopped'
 }
 
 function getConflictChoiceLabel(choice: ConflictChoice): string {

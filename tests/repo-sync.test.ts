@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
-  formatSyncActionSummary,
+  buildMainRepositoryChangePlan,
   buildOriginSyncPlan,
   buildSyncPlan,
   buildUpstreamSyncPlan,
@@ -11,16 +11,12 @@ import {
   getOriginSyncOrder,
   getSyncOrder,
   getUpstreamSyncOrder,
-  markSyncResult,
-  runSyncSequence,
-  summarizeSyncResults,
   type OriginSyncTarget,
   type SyncRepositoryProbe,
   type UpstreamSyncTarget,
 } from '../src/commands/repo/internal/sync.ts'
 import {
   mapConflictChoiceToGitSide,
-  shouldStopAfterConflict,
   type ConflictOperation,
 } from '../src/commands/repo/internal/sync-conflicts.ts'
 
@@ -276,6 +272,45 @@ describe('repo sync planning', () => {
       unrelatedLines: ['?? README.md'],
     })
   })
+
+  test('does not treat gitmodules edits as submodule pointer changes', async () => {
+    const result = await buildMainRepositoryChangePlan({
+      porcelainStatus: ['M  .gitmodules'],
+      allowedPaths: ['backend', 'frontend'],
+      hasPointerChange: async () => true,
+    })
+
+    expect(result).toEqual({
+      committablePaths: [],
+      unrelatedLines: ['M  .gitmodules'],
+    })
+  })
+
+  test('builds committable main pointer plans only from real submodule pointer changes', async () => {
+    const result = await buildMainRepositoryChangePlan({
+      porcelainStatus: [' M backend', ' M frontend', '?? README.md'],
+      allowedPaths: ['backend', 'frontend'],
+      hasPointerChange: async (path) => path === 'backend',
+    })
+
+    expect(result).toEqual({
+      committablePaths: ['backend'],
+      unrelatedLines: ['?? README.md'],
+    })
+  })
+
+  test('treats unreadable submodule pointer state as unrelated work', async () => {
+    const result = await buildMainRepositoryChangePlan({
+      porcelainStatus: [' M backend'],
+      allowedPaths: ['backend'],
+      hasPointerChange: async () => null,
+    })
+
+    expect(result).toEqual({
+      committablePaths: [],
+      unrelatedLines: [' M backend'],
+    })
+  })
 })
 
 describe('repo sync origin and upstream action planning', () => {
@@ -448,71 +483,6 @@ describe('repo sync origin and upstream action planning', () => {
   })
 })
 
-describe('repo sync execution summaries', () => {
-  const planItems = [
-    {
-      role: 'backend',
-      label: 'Backend',
-      dir: 'server',
-      branch: 'main',
-      originUrl: 'https://github.com/acme/server.git',
-      state: 'fast-forward',
-      shouldUpdate: true,
-    },
-    {
-      role: 'frontend',
-      label: 'Frontend',
-      dir: 'web',
-      branch: 'main',
-      originUrl: 'https://github.com/acme/web.git',
-      state: 'up-to-date',
-      shouldUpdate: false,
-    },
-    {
-      role: 'main',
-      label: 'Main',
-      dir: '.',
-      branch: 'main',
-      originUrl: 'https://github.com/acme/app.git',
-      state: 'fast-forward',
-      shouldUpdate: true,
-    },
-  ] as const
-
-  test('summarizes skipped and updated repositories', () => {
-    const results = [
-      markSyncResult(planItems[0], true),
-      markSyncResult(planItems[1], null),
-      markSyncResult(planItems[2], true),
-    ]
-
-    expect(summarizeSyncResults(results)).toEqual({
-      ok: true,
-      updated: ['Backend', 'Main'],
-      skipped: ['Frontend'],
-      failed: [],
-      pending: [],
-    })
-  })
-
-  test('stops sync sequence after first failed fast-forward', async () => {
-    const calls: string[] = []
-    const results = await runSyncSequence(planItems, async (item) => {
-      calls.push(item.label)
-      return item.role !== 'backend'
-    })
-
-    expect(calls).toEqual(['Backend'])
-    expect(summarizeSyncResults(results)).toEqual({
-      ok: false,
-      updated: [],
-      skipped: ['Frontend'],
-      failed: ['Backend'],
-      pending: ['Main'],
-    })
-  })
-})
-
 describe('repo sync command conflict helpers', () => {
   test('maps conflict choices for merge and rebase operations', () => {
     expect(mapConflictChoiceToGitSide('merge' satisfies ConflictOperation, 'local')).toBe('ours')
@@ -521,17 +491,4 @@ describe('repo sync command conflict helpers', () => {
     expect(mapConflictChoiceToGitSide('rebase' satisfies ConflictOperation, 'incoming')).toBe('ours')
   })
 
-  test('stops later repositories after manual or abort conflict choices', () => {
-    expect(shouldStopAfterConflict('manual')).toBe(true)
-    expect(shouldStopAfterConflict('abort')).toBe(true)
-    expect(shouldStopAfterConflict('local')).toBe(false)
-    expect(shouldStopAfterConflict('incoming')).toBe(false)
-  })
-
-  test('formats sync action summaries for wizard prompts', () => {
-    expect(formatSyncActionSummary('Backend', 'rebase-origin', 'origin/main'))
-      .toContain('Backend')
-    expect(formatSyncActionSummary('Backend', 'rebase-origin', 'origin/main'))
-      .toContain('origin/main')
-  })
 })

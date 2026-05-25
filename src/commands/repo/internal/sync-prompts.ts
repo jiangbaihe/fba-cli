@@ -9,6 +9,10 @@ import {
 } from './sync.js'
 
 export type SyncPhase = 'origin' | 'upstream'
+export type UpstreamBranchChoice =
+  | { status: 'selected'; branch: string }
+  | { status: 'skipped' }
+  | { status: 'cancelled' }
 
 export function isCancelled(value: unknown): boolean {
   return clack.isCancel(value) || typeof value === 'symbol'
@@ -82,8 +86,8 @@ export async function promptSyncAction(
   return selected as SyncWizardAction
 }
 
-export async function chooseUpstreamBranch(item: UpstreamSyncPlanItem): Promise<string | null> {
-  if (item.availableBranches.length === 0) return null
+export async function chooseUpstreamBranch(item: UpstreamSyncPlanItem): Promise<UpstreamBranchChoice> {
+  if (item.availableBranches.length === 0) return { status: 'skipped' }
 
   const selected = await clack.select<string>({
     message: `${item.label}: ${rt('repoSyncChooseUpstreamBranch')}`,
@@ -93,8 +97,11 @@ export async function chooseUpstreamBranch(item: UpstreamSyncPlanItem): Promise<
     })),
     initialValue: item.availableBranches[0],
   })
-  if (isCancelled(selected)) return null
-  return selected as string
+  if (isCancelled(selected)) {
+    clack.cancel(chalk.yellow(rt('repoSyncCancelled')))
+    return { status: 'cancelled' }
+  }
+  return { status: 'selected', branch: selected as string }
 }
 
 export async function promptChosenUpstreamAction(item: UpstreamSyncPlanItem): Promise<SyncWizardAction | null> {

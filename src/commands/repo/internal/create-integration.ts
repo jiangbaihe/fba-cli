@@ -12,6 +12,11 @@ export async function cloneRepositoryForMaintenance(
   })
 }
 
+export async function runRepoInitForCreate(projectDir: string): Promise<boolean> {
+  const { repoInitAction } = await import('../init.js')
+  return repoInitAction({ projectDir })
+}
+
 export const repoCreateText = {
   maintenanceQuestion: () => rt('repoMaintenanceQuestion'),
   initNowQuestion: () => rt('repoInitNowQuestion'),

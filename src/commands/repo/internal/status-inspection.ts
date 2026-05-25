@@ -1,12 +1,14 @@
-import { existsSync, readFileSync } from 'fs'
+import { existsSync } from 'fs'
 import { join } from 'path'
 import { rt } from './text.js'
 import {
   OFFICIAL_BACKEND_REPO,
   OFFICIAL_FRONTEND_REPO,
 } from './constants.js'
+import { isDirectoryEmpty, readOptionalTextFile } from './files.js'
 import {
   getPorcelainStatus,
+  getCurrentBranch,
   getRemoteUrl,
   isGitRepo,
   isGitRepoRoot,
@@ -27,9 +29,11 @@ interface RepoRuntimeStatus {
   exists: boolean
   isGitRepo: boolean
   isGitRoot: boolean
+  isEmptyDirectory?: boolean
   isShallow: boolean
   originUrl: string | null
   upstreamUrl: string | null
+  currentBranch: string | null
   porcelainStatus: string[] | null
 }
 
@@ -44,48 +48,58 @@ export interface ProjectStatusInspection {
   recommendedActions: RecommendedStatusAction[]
 }
 
-async function inspectRepository(dir: string): Promise<RepoRuntimeStatus> {
+async function inspectRepository(
+  dir: string,
+  options: { allowInheritedGitRepo?: boolean } = {},
+): Promise<RepoRuntimeStatus> {
   const exists = existsSync(dir)
   if (!exists) {
     return {
       exists,
       isGitRepo: false,
       isGitRoot: false,
+      isEmptyDirectory: undefined,
       isShallow: false,
       originUrl: null,
       upstreamUrl: null,
+      currentBranch: null,
       porcelainStatus: null,
     }
   }
 
-  const repo = await isGitRepo(dir)
-  if (!repo) {
+  const root = await isGitRepoRoot(dir)
+  if (!root) {
+    const repo = options.allowInheritedGitRepo ? await isGitRepo(dir) : false
     return {
       exists,
-      isGitRepo: false,
+      isGitRepo: repo,
       isGitRoot: false,
+      isEmptyDirectory: isDirectoryEmpty(dir),
       isShallow: false,
       originUrl: null,
       upstreamUrl: null,
+      currentBranch: null,
       porcelainStatus: null,
     }
   }
 
-  const [root, shallow, originUrl, upstreamUrl, porcelainStatus] = await Promise.all([
-    isGitRepoRoot(dir),
+  const [shallow, originUrl, upstreamUrl, currentBranch, porcelainStatus] = await Promise.all([
     isShallowRepo(dir),
     getRemoteUrl(dir, 'origin'),
     getRemoteUrl(dir, 'upstream'),
+    getCurrentBranch(dir),
     getPorcelainStatus(dir),
   ])
 
   return {
     exists,
-    isGitRepo: repo,
+    isGitRepo: true,
     isGitRoot: root,
+    isEmptyDirectory: false,
     isShallow: shallow,
     originUrl,
     upstreamUrl,
+    currentBranch,
     porcelainStatus,
   }
 }
@@ -96,7 +110,7 @@ export async function buildProjectStatus(projectDir: string): Promise<ProjectSta
   const frontendDir = join(projectDir, config.frontend_name)
 
   const [main, backend, frontend] = await Promise.all([
-    inspectRepository(projectDir),
+    inspectRepository(projectDir, { allowInheritedGitRepo: true }),
     inspectRepository(backendDir),
     inspectRepository(frontendDir),
   ])
@@ -122,7 +136,7 @@ export async function buildProjectStatus(projectDir: string): Promise<ProjectSta
 
   const gitmodulesPath = join(projectDir, '.gitmodules')
   const gitmodulesChecks = assessGitmodules({
-    content: existsSync(gitmodulesPath) ? readFileSync(gitmodulesPath, 'utf-8') : null,
+    content: readOptionalTextFile(gitmodulesPath),
     backendName: config.backend_name,
     backendOrigin: backend.originUrl,
     frontendName: config.frontend_name,

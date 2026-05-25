@@ -16,20 +16,21 @@ const repoReleaseWorkflow = readFileSync(
   join(rootDir, '.github', 'workflows', 'repo-release.yml'),
   'utf-8',
 )
+const repoReadme = readFileSync(join(rootDir, 'src', 'commands', 'repo', 'README.md'), 'utf-8')
+const repoReleaseDesign = readFileSync(
+  join(rootDir, 'src', 'commands', 'repo', 'docs', 'repo-release-design.md'),
+  'utf-8',
+)
 
 describe('package scripts', () => {
-  test('keeps the CLI bin pointed at the built release artifact', () => {
+  test('keeps package metadata aligned with built release artifacts', () => {
     expect(packageJson.bin?.['fba-cli']).toBe('./dist/index.js')
     expect(packageJson.scripts?.build).toBe(
       'tsup src/index.ts --format esm --out-dir dist --target node18 --clean',
     )
-    expect(packageJson.scripts?.prepare).toBeUndefined()
-    expect(packageJson.files).toContain('dist')
-  })
-
-  test('keeps package lifecycle aligned with the upstream npm scripts', () => {
     expect(packageJson.scripts?.prepublishOnly).toBe('npm run typecheck && npm run build')
     expect(packageJson.scripts?.prepare).toBeUndefined()
+    expect(packageJson.files).toContain('dist')
   })
 
   test('keeps generated release artifacts out of source commits', () => {
@@ -46,7 +47,7 @@ describe('package scripts', () => {
   })
 
   test('publishes repo experimental GitHub Release assets from a separate workflow', () => {
-    expect(repoReleaseWorkflow).toContain('repo-v*')
+    expect(repoReleaseWorkflow).toContain('repo-latest')
     expect(repoReleaseWorkflow).toContain('fba-cli.tgz')
     expect(repoReleaseWorkflow).toContain('softprops/action-gh-release')
     expect(repoReleaseWorkflow).toContain('oven-sh/setup-bun')
@@ -54,7 +55,17 @@ describe('package scripts', () => {
     expect(repoReleaseWorkflow).toContain('bun test --isolate')
     expect(repoReleaseWorkflow).toContain('pnpm run typecheck')
     expect(repoReleaseWorkflow).toContain('pnpm run build')
+    expect(repoReleaseWorkflow).toContain('overwrite_files: true')
+    expect(repoReleaseWorkflow).toContain('make_latest: false')
     expect(repoReleaseWorkflow).not.toContain('pnpm publish')
     expect(repoReleaseWorkflow).not.toContain('NPM_TOKEN')
+  })
+
+  test('uses fixed repo-latest release download URLs in experimental install docs', () => {
+    const installDocs = `${repoReadme}\n${repoReleaseDesign}`
+
+    expect(installDocs).not.toContain('/releases/latest/download/')
+    expect(installDocs).toContain('/releases/download/repo-latest/fba-cli.tgz')
+    expect(installDocs).not.toContain('/releases/download/repo-v')
   })
 })

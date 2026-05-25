@@ -1,6 +1,7 @@
 import { run } from './process.js'
 
 export type GitHubTokenSource = 'GITHUB_TOKEN' | 'GH_TOKEN' | 'gh' | 'git-credential'
+const TOKEN_HELPER_TIMEOUT = 5000
 
 export interface GitHubTokenResult {
   source: GitHubTokenSource
@@ -23,6 +24,7 @@ export async function readGhAuthToken(): Promise<GitHubTokenResult | null> {
   const result = await run('gh', ['auth', 'token'], {
     stdio: 'pipe',
     showErrorOutput: false,
+    timeout: TOKEN_HELPER_TIMEOUT,
     env: { GH_PROMPT_DISABLED: '1' },
   })
   const token = result.stdout.trim()
@@ -41,7 +43,7 @@ export async function readGitCredentialToken(): Promise<GitHubTokenResult | null
       '',
       '',
     ].join('\n'),
-    timeout: 5000,
+    timeout: TOKEN_HELPER_TIMEOUT,
     env: {
       GCM_INTERACTIVE: 'never',
       GIT_TERMINAL_PROMPT: '0',

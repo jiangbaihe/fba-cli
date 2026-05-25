@@ -21,6 +21,7 @@ import { gitClone } from "../lib/git.js";
 import {
   cloneRepositoryForMaintenance,
   repoCreateText,
+  runRepoInitForCreate,
 } from "./repo/internal/create-integration.js";
 import { isDockerAvailable, composeUp, composeDown } from "../lib/docker.js";
 import {
@@ -61,6 +62,7 @@ const FRONTEND_REPO =
 // ─── 回退机制 ───
 let _cleanupDir: string | null = null;
 let _infraDir: string | null = null;
+let _repoInitInProgress = false;
 
 function normalizeProjectRootInput(value?: string): string {
   const projectRoot = value?.trim();
@@ -129,6 +131,8 @@ function formatEnvCheckStatus(check: {
 export async function createAction() {
   // ─── 注册 SIGINT 清理 ───
   const sigintHandler = () => {
+    if (_repoInitInProgress) return;
+    if (!_cleanupDir) process.exit(130);
     cleanup().then(() => process.exit(130));
   };
   process.on("SIGINT", sigintHandler);
@@ -709,13 +713,15 @@ async function _createFlow() {
     });
     if (!clack.isCancel(runRepoInit) && runRepoInit) {
       try {
-        const { repoInitAction } = await import("./repo/init.js");
-        const initialized = await repoInitAction({ projectDir });
+        _repoInitInProgress = true;
+        const initialized = await runRepoInitForCreate(projectDir);
         if (!initialized) {
           clack.log.warn(chalk.yellow(repoCreateText.initFailedHint()));
         }
       } catch {
         clack.log.warn(chalk.yellow(repoCreateText.initFailedHint()));
+      } finally {
+        _repoInitInProgress = false;
       }
     }
   }

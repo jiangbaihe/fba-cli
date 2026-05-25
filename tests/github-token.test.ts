@@ -45,6 +45,7 @@ describe('GitHub token discovery', () => {
     expect(runMock).toHaveBeenCalledWith('gh', ['auth', 'token'], {
       stdio: 'pipe',
       showErrorOutput: false,
+      timeout: 5000,
       env: { GH_PROMPT_DISABLED: '1' },
     })
   })

@@ -4,6 +4,7 @@ import { existsSync } from 'fs'
 import { join } from 'path'
 import { resolveProjectDir } from '../../../lib/config.js'
 import { rt } from './text.js'
+import { formatErrorMessage } from './display.js'
 import { buildProjectStatus } from './status-inspection.js'
 import { readStrictProjectConfig } from './project.js'
 import {
@@ -35,9 +36,11 @@ function renderCheck(check: StatusCheck): string {
   return `  ${color(statusMarker(check.level).padEnd(5))} ${check.message}${detail}`
 }
 
-function getStatusHint(level: StatusLevel): string {
+function getStatusHint(level: StatusLevel, actions: RecommendedStatusAction[]): string {
   if (level === 'ok') return rt('repoStatusHintOk')
-  if (level === 'warn') return rt('repoStatusHintWarn')
+  if (level === 'warn') {
+    return actions.includes('init') ? rt('repoStatusHintWarn') : rt('repoStatusHintManual')
+  }
   return rt('repoStatusHintError')
 }
 
@@ -102,7 +105,7 @@ export async function repoStatusAction(options: RepoStatusActionOptions = {}) {
   try {
     config = readStrictProjectConfig(projectDir)
   } catch (error) {
-    console.log(chalk.red(error instanceof Error ? error.message : String(error)))
+    console.log(chalk.red(formatErrorMessage(error)))
     return
   }
 
@@ -116,10 +119,16 @@ export async function repoStatusAction(options: RepoStatusActionOptions = {}) {
     return
   }
 
-  const status = await buildProjectStatus(projectDir)
+  let status: Awaited<ReturnType<typeof buildProjectStatus>>
+  try {
+    status = await buildProjectStatus(projectDir)
+  } catch (error) {
+    console.log(chalk.red(formatErrorMessage(error)))
+    return
+  }
 
   console.log(chalk.bold(rt('repoStatusTitle')))
-  console.log(`${config.name} ${chalk.dim(projectDir)}`)
+  console.log(`${status.config.name} ${chalk.dim(projectDir)}`)
   console.log(`${rt('repoStatusOverall')}: ${statusColor(status.overall)(statusMarker(status.overall))}`)
 
   printSection(rt('repoInitRoleMain'), status.mainChecks)
@@ -128,7 +137,7 @@ export async function repoStatusAction(options: RepoStatusActionOptions = {}) {
   printSection('.gitmodules', status.gitmodulesChecks)
 
   console.log()
-  console.log(chalk.dim(getStatusHint(status.overall)))
+  console.log(chalk.dim(getStatusHint(status.overall, status.recommendedActions)))
 
   const selectedAction = await promptNextStatusAction(status.recommendedActions)
   if (!selectedAction || selectedAction === 'exit') {

@@ -10,7 +10,7 @@ const repoMessages = {
     cmdRepo: '实验性仓库维护',
     cmdRepoInit: '初始化 GitHub 远程仓库配置（实验性）',
     cmdRepoStatus: '检查本地仓库维护状态（实验性）',
-    cmdRepoPush: '按后端、前端、主仓顺序推送干净提交（实验性）',
+    cmdRepoPush: '以向导方式选择并推送干净提交（实验性）',
     cmdRepoSync: '以向导方式同步 origin/upstream（实验性）',
     useNotFbaProject: '当前目录不是 FBA 项目（未找到 .fba.json）',
     backendDirNotFound: '后端目录未找到',
@@ -47,6 +47,15 @@ const repoMessages = {
     repoInitLocalMainGit: '如主目录还不是 Git 仓库，则初始化 main 分支',
     repoInitLocalCommitPrompt: '完成后询问是否创建本地初始化提交',
     repoInitNoPush: '不会执行 git push。',
+    repoInitMissingChildrenQuestion: '检测到缺失或未初始化的子仓：{paths}。是否现在初始化这些子仓？',
+    repoInitMissingChildrenFailed: '子仓初始化失败，请检查 .gitmodules、目录状态和网络后重新运行 fba-cli repo init。',
+    repoInitMissingChildrenMainGitRequired:
+      '主仓必须是 Git 仓库根目录，才能从 .gitmodules 初始化缺失子仓。请先克隆主仓或手动整理项目目录。',
+    repoInitMissingChildrenGitlinkMissing:
+      '主仓 HEAD 没有记录这些子仓的 gitlink：{paths}。请先从包含子模块指针的主仓提交运行 repo init，或先手动添加子模块。',
+    repoInitNonEmptyChildDirUnsupported:
+      '子仓目录 {paths} 已存在且不是 Git 根目录。repo init 不会覆盖其中的文件，请先手动备份、移走或整理为 Git 仓库。',
+    repoInitMissingChildrenNewRepoUnsupported: '缺失子仓 {paths} 不能从本轮新建的空 GitHub 仓库初始化。请先提供已有子仓远程，或在本地创建子仓后再运行 repo init。',
     repoInitGitMissing: '未找到 git，请安装 Git 后重新运行 "fba-cli repo init"',
     repoInitChildGitRootRequired: '必须是 Git 仓库根目录',
     repoInitChildGitRootHint: '请确认前后端目录来自 fba-cli create 的克隆仓库，再重新运行 fba-cli repo init。',
@@ -58,8 +67,11 @@ const repoMessages = {
       'GitHub 仓库创建失败。仓库可能已存在，或名称/权限不符合要求',
     repoInitGithubRequestFailed: 'GitHub 请求失败',
     repoInitApplyFailed: '远程仓库初始化未完成。项目已保留，本地更改已回滚。',
+    repoInitRollbackFailed: '本地更改回滚不完整，请检查 .gitmodules、.git 和子仓目录。',
     repoInitRetryHint: '请修复问题后重新运行: fba-cli repo init。已创建的远程仓库会保留。',
     repoInitCommitQuestion: '是否创建本地初始化提交？不会执行 git push。',
+    repoInitMainDetachedCommitSkipped:
+      '主仓当前处于 detached HEAD，已跳过本地初始化提交。请先切换到分支后手动提交。',
     repoInitStagingCommit: '暂存仓库元数据',
     repoInitCreatingCommit: '创建本地仓库初始化提交',
     repoInitCommitFailedHint:
@@ -72,7 +84,8 @@ const repoMessages = {
     repoStatusOverall: '整体状态',
     repoStatusHintOk: '仓库配置看起来正常。',
     repoStatusHintWarn: '存在可修正项，可运行 "fba-cli repo init" 重新整理本地仓库配置。',
-    repoStatusHintError: '存在阻断问题，请检查项目结构，必要时重新运行 "fba-cli repo init"。',
+    repoStatusHintManual: '存在需要手动判断的提示项，请根据上方状态检查本地仓库。',
+    repoStatusHintError: '存在阻断问题，请根据上方状态手动检查并修正项目结构。',
     repoStatusDirMissing: '{label} 目录不存在',
     repoStatusGitOk: '{label} 是 Git 仓库',
     repoStatusGitError: '{label} 不是 Git 仓库',
@@ -82,12 +95,16 @@ const repoMessages = {
     repoStatusShallowWarn: '{label} 是浅克隆',
     repoStatusOriginOk: '{label} 已配置 origin',
     repoStatusOriginWarn: '{label} 未配置 origin',
+    repoStatusBranchOk: '{label} 当前分支为 {branch}',
+    repoStatusBranchWarn: '{label} 当前处于 detached HEAD 或没有当前分支',
     repoStatusUpstreamOk: '{label} upstream 指向官方仓库',
     repoStatusUpstreamWarn: '{label} upstream 未指向官方仓库',
     repoStatusUpstreamExists: '{label} 已配置 upstream',
     repoStatusWorkingTreeOk: '{label} 工作区干净',
     repoStatusWorkingTreeWarn: '{label} 工作区有本地改动',
     repoStatusWorkingTreeUnreadable: '{label} 工作区状态读取失败',
+    repoStatusChildDirContentError:
+      '{label} 目录已存在且不是 Git 根目录，repo init 不会覆盖其中的文件',
     repoStatusChangedItems: '{count} 个变更项',
     repoStatusGitmodulesMissing: '缺少 .gitmodules',
     repoStatusGitmodulesEntryMissing: '.gitmodules 缺少 {role} 条目',
@@ -111,7 +128,19 @@ const repoMessages = {
     repoStatusCancelled: '已取消仓库状态检查',
     repoPushPlanTitle: '将按以下顺序推送:',
     repoPushConfirmProject: '为以下项目推送仓库:',
-    repoPushNoHiddenActions: '不会执行 pull、merge、rebase、commit、tag push 或 force push。',
+    repoPushNoHiddenActions: '不会执行 pull、merge、rebase、业务提交、tag push 或 force push。',
+    repoPushChooseTargets: '本次要推送哪些仓库？',
+    repoPushNoTargets: '未选择任何仓库，已取消推送。',
+    repoPushPointerCommitQuestion: '检测到主仓子仓指针变化，是否创建本地主仓提交？',
+    repoPushPointerSkipped: '已跳过主仓子仓指针提交。主仓不会记录当前子仓 HEAD。',
+    repoPushPointerUnrelatedChanges: '主仓还有其它未提交改动，请先手动整理后再运行 fba-cli repo push。',
+    repoPushPointerCommitFailed: '主仓子仓指针提交失败，请检查 git status 后手动处理。',
+    repoPushPointerRequiresChildPush:
+      '不能创建指向未选子仓提交的主仓指针提交。请同时选择对应子仓，或跳过本次指针提交后只推送主仓已有提交。',
+    repoPushUnpushedSubmoduleRefs:
+      '主仓当前提交引用了尚未推送到 origin、未包含在本次所选子仓 HEAD 中，或无法确认的子仓提交',
+    repoPushMainRequiresPushedSubmodules:
+      '不能安全推送主仓。请先整理并推送这些子仓，或让本次所选子仓 HEAD 包含主仓引用的提交。',
     repoPushWarnings: '警告:',
     repoPushPrecheckFailed: '仓库推送前检查未通过',
     repoPushFixHint: '请先在本地修正问题，再重新运行 fba-cli repo push。',
@@ -157,7 +186,7 @@ const repoMessages = {
     repoSyncActionPushOrSkipHint: '本地领先远程，建议之后运行 repo push',
     repoSyncRebasePublishedWarning: '检测到本地提交可能已经推送过，rebase 会改写历史；建议 merge。',
     repoSyncUpstreamMismatch: 'upstream 未指向官方仓库，跳过',
-    repoSyncUpstreamFetchFailed: 'upstream fetch 失败，跳过',
+    repoSyncUpstreamFetchFailed: 'upstream fetch 失败',
     repoSyncUpstreamNoIncomingUpdates: '本地包含项目提交，官方 upstream 没有新提交，跳过',
     repoSyncMainMayRefreshProjectMetadata: '主仓可从 origin 更新；先更新主仓后，将用最新 .fba.json、.gitmodules 和子仓目录重新检查。',
     repoSyncConflictTitle: '发现冲突',
@@ -195,7 +224,7 @@ const repoMessages = {
     cmdRepo: 'Experimental repository maintenance',
     cmdRepoInit: 'Initialize GitHub remote repository setup (experimental)',
     cmdRepoStatus: 'Check local repository maintenance status (experimental)',
-    cmdRepoPush: 'Push clean commits in backend, frontend, main order (experimental)',
+    cmdRepoPush: 'Choose and push clean commits with a guided workflow (experimental)',
     cmdRepoSync: 'Synchronize origin/upstream with a guided workflow (experimental)',
     useNotFbaProject: 'Current directory is not an FBA project (.fba.json not found)',
     backendDirNotFound: 'Backend directory not found',
@@ -233,6 +262,15 @@ const repoMessages = {
     repoInitLocalMainGit: 'initialize the main branch if the project directory is not a Git repo root',
     repoInitLocalCommitPrompt: 'ask whether to create a local initialization commit afterward',
     repoInitNoPush: 'No git push will be executed.',
+    repoInitMissingChildrenQuestion: 'Missing or uninitialized child repositories detected: {paths}. Initialize them now?',
+    repoInitMissingChildrenFailed: 'Child repository initialization failed. Check .gitmodules, directory state, and network, then rerun fba-cli repo init.',
+    repoInitMissingChildrenMainGitRequired:
+      'The main repository must be a Git root before missing child repositories can be initialized from .gitmodules. Clone the main repository or fix the project directory first.',
+    repoInitMissingChildrenGitlinkMissing:
+      'The main HEAD does not record gitlinks for these child repositories: {paths}. Run repo init from a main commit with submodule pointers, or add the submodules manually first.',
+    repoInitNonEmptyChildDirUnsupported:
+      'Child directories {paths} already exist and are not Git roots. repo init will not overwrite their files; back them up, move them away, or make them Git repositories first.',
+    repoInitMissingChildrenNewRepoUnsupported: 'Missing child repositories {paths} cannot be initialized from newly-created empty GitHub repositories. Provide existing child remotes, or create the child repositories locally before rerunning repo init.',
     repoInitGitMissing: 'git was not found. Install Git and rerun "fba-cli repo init".',
     repoInitChildGitRootRequired: 'must be a Git repository root',
     repoInitChildGitRootHint:
@@ -246,9 +284,13 @@ const repoMessages = {
     repoInitGithubRequestFailed: 'GitHub request failed',
     repoInitApplyFailed:
       'Repository initialization did not complete. The project was kept and local changes were rolled back.',
+    repoInitRollbackFailed:
+      'Local rollback did not complete. Check .gitmodules, .git, and child repository directories.',
     repoInitRetryHint:
       'Fix the issue and run: fba-cli repo init. Created remote repositories are kept.',
     repoInitCommitQuestion: 'Create a local initialization commit? No push will be executed.',
+    repoInitMainDetachedCommitSkipped:
+      'Main repository is detached. The local initialization commit was skipped; switch to a branch and commit manually.',
     repoInitStagingCommit: 'Staging repository metadata',
     repoInitCreatingCommit: 'Creating local repository init commit',
     repoInitCommitFailedHint:
@@ -262,8 +304,10 @@ const repoMessages = {
     repoStatusHintOk: 'Repository configuration looks good.',
     repoStatusHintWarn:
       'Some items can be fixed. Run "fba-cli repo init" to refresh local repository setup.',
+    repoStatusHintManual:
+      'Some warnings need manual judgment. Inspect the repository state above.',
     repoStatusHintError:
-      'Blocking issues found. Check the project structure and rerun "fba-cli repo init" if needed.',
+      'Blocking issues found. Inspect the status above and fix the project structure manually.',
     repoStatusDirMissing: '{label} directory is missing',
     repoStatusGitOk: '{label} is a git repository',
     repoStatusGitError: '{label} is not a git repository',
@@ -273,12 +317,16 @@ const repoMessages = {
     repoStatusShallowWarn: '{label} is a shallow clone',
     repoStatusOriginOk: '{label} has origin remote',
     repoStatusOriginWarn: '{label} has no origin remote',
+    repoStatusBranchOk: '{label} current branch is {branch}',
+    repoStatusBranchWarn: '{label} is detached or has no current branch',
     repoStatusUpstreamOk: '{label} upstream matches official repository',
     repoStatusUpstreamWarn: '{label} upstream does not match official repository',
     repoStatusUpstreamExists: '{label} has upstream remote',
     repoStatusWorkingTreeOk: '{label} working tree is clean',
     repoStatusWorkingTreeWarn: '{label} working tree has local changes',
     repoStatusWorkingTreeUnreadable: '{label} working tree status could not be read',
+    repoStatusChildDirContentError:
+      '{label} exists but is not a Git root; repo init will not overwrite files in it',
     repoStatusChangedItems: '{count} changed item(s)',
     repoStatusGitmodulesMissing: '.gitmodules is missing',
     repoStatusGitmodulesEntryMissing: '.gitmodules has no {role} entry',
@@ -302,7 +350,19 @@ const repoMessages = {
     repoStatusCancelled: 'Repository status check cancelled',
     repoPushPlanTitle: 'Repositories will be pushed in this order:',
     repoPushConfirmProject: 'Push repositories for',
-    repoPushNoHiddenActions: 'No pull, merge, rebase, commit, tag push, or force push will run.',
+    repoPushNoHiddenActions: 'No pull, merge, rebase, business commit, tag push, or force push will run.',
+    repoPushChooseTargets: 'Which repositories should be pushed this time?',
+    repoPushNoTargets: 'No repositories selected. Push cancelled.',
+    repoPushPointerCommitQuestion: 'Main repository submodule pointer changes detected. Create a local main commit?',
+    repoPushPointerSkipped: 'Main pointer commit skipped. Main will not record the current child HEADs.',
+    repoPushPointerUnrelatedChanges: 'Main repository has other uncommitted changes. Handle them manually before rerunning fba-cli repo push.',
+    repoPushPointerCommitFailed: 'Main pointer commit failed. Check git status and handle it manually.',
+    repoPushPointerRequiresChildPush:
+      'Cannot create a main pointer commit for child repositories that are not selected for this push. Select the affected child repositories, or skip the pointer commit and push existing main commits only.',
+    repoPushUnpushedSubmoduleRefs:
+      'Main currently references child commits that are not on origin, not contained in the selected child HEAD, or cannot be verified',
+    repoPushMainRequiresPushedSubmodules:
+      'Cannot safely push main. Push these child repositories first, or make the selected child HEAD contain the commit referenced by main.',
     repoPushWarnings: 'Warnings:',
     repoPushPrecheckFailed: 'Repository push precheck failed',
     repoPushFixHint: 'Fix the local issues and rerun fba-cli repo push.',
@@ -349,7 +409,7 @@ const repoMessages = {
     repoSyncActionPushOrSkipHint: 'local branch is ahead; run repo push later',
     repoSyncRebasePublishedWarning: 'Local commits may already be pushed; rebase rewrites history. Merge is recommended.',
     repoSyncUpstreamMismatch: 'upstream does not match the official repository; skipped',
-    repoSyncUpstreamFetchFailed: 'upstream fetch failed; skipped',
+    repoSyncUpstreamFetchFailed: 'upstream fetch failed',
     repoSyncUpstreamNoIncomingUpdates: 'Local project commits exist, but official upstream has no incoming commits; skipped',
     repoSyncMainMayRefreshProjectMetadata: 'Main can update from origin. After updating main, the project will be checked again with the latest .fba.json, .gitmodules, and child directories.',
     repoSyncConflictTitle: 'Conflict detected',
